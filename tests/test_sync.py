@@ -148,6 +148,55 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(report["stop_reason"], "login_required")
         self.assertEqual(report["status"], "partial")
 
+    def test_one_unresolved_collection_does_not_block_known_history(self):
+        def discovery(client, profile, collection, *args, **kwargs):
+            if collection == "reposts":
+                return {
+                    "ids": [],
+                    "status": "failed",
+                    "stop_reason": "unresolved",
+                    "failures": ["unsupported_list_structure"],
+                }
+            return {"ids": [], "status": "observed", "stop_reason": "known_overlap"}
+
+        with (
+            patch("knowledge_archive.adapters.x.sync.discover", side_effect=discovery),
+            patch(
+                "knowledge_archive.adapters.x.sync.capture_thread",
+                side_effect=self.capture,
+            ),
+            patch("knowledge_archive.adapters.x.sync.ingest", side_effect=self.ingest),
+        ):
+            report = sync(self.store, object(), max_entries=1)
+        self.assertEqual(self.seen, [("100", False)])
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["discoveries"]["reposts"]["status"], "failed")
+        self.assertEqual(
+            report["failures"],
+            [
+                {
+                    "collection": "reposts",
+                    "error": "unresolved",
+                    "details": ["unsupported_list_structure"],
+                }
+            ],
+        )
+
+    def test_identity_failures_stop_all_account_work(self):
+        for reason in ("wrong_account", "wrong_route"):
+            with (
+                self.subTest(reason=reason),
+                patch(
+                    "knowledge_archive.adapters.x.sync.discover",
+                    return_value={"ids": [], "status": "failed", "stop_reason": reason},
+                ),
+                patch("knowledge_archive.adapters.x.sync.capture_thread") as capture,
+            ):
+                report = sync(self.store, object())
+                capture.assert_not_called()
+                self.assertEqual(report["stop_reason"], reason)
+                self.assertEqual(report["failures"][0]["error"], reason)
+
     def test_pending_collection_membership_survives_budget_and_failure(self):
         def discovered(client, profile, collection, *args, **kwargs):
             return {

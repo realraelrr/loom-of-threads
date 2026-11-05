@@ -20,11 +20,13 @@ class Browser:
         self.observations = iter(observations)
         self.owned = owned
         self.closed = []
+        self.urls = []
 
     def call(self, name, *args):
         if name == "list_pages":
             return {"pages": [{"id": 1}]}
         if name == "new_page":
+            self.urls.append(args[0])
             return {"pages": [{"id": 1}, {"id": 2}]}
         if name == "close_page":
             self.closed.append(args[0])
@@ -41,6 +43,14 @@ class Browser:
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_reposts_uses_dedicated_route(self):
+        with tempfile.TemporaryDirectory() as temp:
+            browser = Browser([observation(["1"])])
+            discover(
+                browser, "example", "reposts", Path(temp) / "scan", [], max_scrolls=0
+            )
+            self.assertEqual(browser.urls, ["https://x.com/example/reposts"])
+
     def run_scan(self, browser, known=(), **kwargs):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

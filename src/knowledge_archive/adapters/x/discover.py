@@ -89,13 +89,13 @@ def discover(
     seen, visible, consecutive, idle = set(), set(), 0, 0
     try:
         before = {p["id"] for p in client.call("list_pages")["pages"]}
-        url = f"https://x.com/{profile}" + ("/likes" if collection == "likes" else "")
+        url = f"https://x.com/{profile}/{collection}"
         pages = client.call("new_page", url, "--background", "--timeout=25000")["pages"]
         created = [p for p in pages if p["id"] not in before]
         if len(created) != 1:
             raise CaptureError("Cannot identify newly created discovery tab")
         page_id = created[0]["id"]
-        routes = ["/" + profile.lower()]
+        routes = ["/" + profile.lower() + "/reposts"]
         if collection == "likes":
             routes = ["/" + profile.lower() + "/likes", "/i/history/likes"]
         claim = (

@@ -70,7 +70,7 @@ loom --root /path/to/archive sync-x --resume RUN_ID
 
 `sync-x` 报告新内容和 `needs_curation`，不替 Agent 编造标签或综述。接着按维护 Skill 整理，运行 `fetch` 和 `build`。预算到期退出码 2 表示仍有待办；登录失效、账号不符、页面变化应检查报告，不能宣称同步完整。列表静止不能证明账户历史完整。定期运行应保留 `raw/sync-state.json` 和 `.archive/sync/`；前者随真源备份，后者用于精确断点恢复，不要每次删进度重来。
 
-真实验收覆盖点赞列表与账户匹配、无转发时不误收普通帖；转发正样本目前由合成测试覆盖。Note Tweet 的 `inline_media` 非空布局仍缺真实协议样本，保留明确缺口；X Articles 图文位置已支持。
+真实验收覆盖点赞列表与账户匹配、独立转帖列表和转发事件到原帖的解析。转发事件 ID 与原帖 ID 分开保存，同一内容因点赞和转发收录时共享一个入口。Note Tweet 的 `inline_media` 非空布局仍缺真实协议样本，保留明确缺口；X Articles 图文位置已支持。
 
 ## X 单帖与线程采集
 

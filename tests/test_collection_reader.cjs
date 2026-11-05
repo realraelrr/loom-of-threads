@@ -19,12 +19,29 @@ test('likes require explicit viewer state and ignore promoted rows', () => {
   assert.equal(result.page_state, 'content');
 });
 test('reposts cannot be inferred from an author or social text', () => {
-  const result = read([row('1', {retweeted: true}), {...row('2', {retweeted: false}), socialContext: {text: 'You reposted'}}], {collection: 'reposts', pathname: '/example'});
+  const result = read([row('1', {retweeted: true}), {...row('2', {retweeted: false}), socialContext: {text: 'You reposted'}}], {collection: 'reposts', pathname: '/example/reposts'});
   assert.deepEqual(result.selected_ids, ['1']);
+});
+test('repost event wrapper resolves to original source and preserves event evidence', () => {
+  const wrapper = row('900', {user: {id_str: '20', screen_name: 'Example'}, retweeted: true,
+    retweeted_status: row('100', {retweeted: true}).tweet});
+  const result = read([wrapper], {collection: 'reposts', pathname: '/example/reposts'});
+  assert.deepEqual(result.selected_ids, ['100']);
+  assert.equal(result.rows[0].event_id, '900');
+  assert.equal(result.rows[0].actor_handle, 'Example');
+  assert.equal(result.rows[0].author_handle, 'author');
+});
+test('repost wrapper from another actor and malformed source remain gaps', () => {
+  const other = row('900', {retweeted: true, retweeted_status: row('100').tweet});
+  const invalid = row('901', {retweeted: true, retweeted_status: {id_str: 100}});
+  const result = read([other, invalid], {collection: 'reposts', pathname: '/example/reposts'});
+  assert.deepEqual(result.selected_ids, []);
+  assert.deepEqual(result.issues, ['repost_actor_mismatch', 'invalid_reposted_source_id']);
 });
 test('wrong logged-in account, route and login fail explicitly', () => {
   assert.equal(read([row('1')], {account: 'other'}).page_state, 'wrong_account');
   assert.equal(read([row('1')], {pathname: '/home'}).page_state, 'wrong_route');
+  assert.equal(read([row('1', {retweeted: true})], {collection: 'reposts', pathname: '/example'}).page_state, 'wrong_route');
   assert.equal(read([], {login: true}).page_state, 'login_required');
   assert.equal(read([], {account: null}).page_state, 'unresolved_account');
 });

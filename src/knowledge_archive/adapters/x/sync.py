@@ -192,9 +192,24 @@ def _run(
                 "count": len(report["ids"]),
                 "path": str(output.relative_to(store.root)),
             }
-            atomic_json(run_path, run)
             if report["status"] == "failed":
-                stopped = report["stop_reason"]
+                run["failures"].append(
+                    {
+                        "collection": collection,
+                        "error": report.get("error") or report["stop_reason"],
+                        "details": report.get("failures", []),
+                    }
+                )
+                # A broken list parser does not invalidate already known entry
+                # IDs. Authentication/identity failures do affect the account.
+                if report["stop_reason"] in (
+                    "login_required",
+                    "wrong_account",
+                    "wrong_route",
+                ):
+                    stopped = report["stop_reason"]
+            atomic_json(run_path, run)
+            if stopped:
                 break
         if stopped is None:
             data = store.load()
@@ -325,6 +340,10 @@ def _run(
         if i >= previous_failures
         or (
             f.get("id") and state["attempts"].get(f["id"], {}).get("status") == "failed"
+        )
+        or (
+            f.get("collection")
+            and run["discoveries"].get(f["collection"], {}).get("status") == "failed"
         )
     ]
     partial = bool(
