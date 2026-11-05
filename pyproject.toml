@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowledge-archive-engine"
+version = "0.1.0"
+description = "Auditable local knowledge archives with source-specific capture adapters"
+requires-python = ">=3.11"
+dependencies = []
+license = { file = "LICENSE" }
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"knowledge_archive.adapters.x" = ["*.js"]
+
+[project.scripts]
+knowledge-archive = "knowledge_archive.cli:main"
