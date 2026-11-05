@@ -7,6 +7,7 @@ The core accepts normalized source records. It has no Chrome, X, React, or Draft
 - `archive.toml`: instance title and network policy.
 - `raw/archive.json`: schema-versioned current records, collection entries, assets, taxonomy, labels, and synthesis.
 - `raw/evidence/`: immutable provider observations, retained separately from the current normalized snapshot.
+- `raw/sync-state.json`: authoritative unfinished scan baselines, pending collection decisions, and attempt rotation; included in source backups. `.archive/sync/` holds per-run reports and resumable capture checkpoints.
 - `media/`: archived bytes. Each asset has a URL identity and verified byte digest. These files require backups.
 
 Entries identify collection decisions. Records identify source content and can be members of several entries. Captured thread/context records are not additional user likes. New adapter entry IDs are namespaced; migrated IDs remain stable so old synthesis citations survive.
@@ -28,3 +29,7 @@ Each build writes a fresh generation containing Markdown, SQLite, and a source f
 Add another source adapter producing normalized blocks and evidence. Core blocks are markdown, image, video, quote, and divider. Media and textual formats coexist in a record. Do not add speculative plugin registries or parallel models without a concrete source requirement.
 
 The synthetic demo exercises a non-X source without browser access. Source adapters and browser transport can evolve independently of local knowledge bases.
+
+## Incremental collection discovery
+
+Discovery verifies the logged-in account, collection route, and explicit viewer action flags. A known-ID overlap is a bounded incremental boundary, not proof of full platform history. Partial scans retain their original baseline and advance replay depth across runs; newly ingested prefixes cannot prematurely become the stop boundary. Capture attempt counts rotate historical work so one unresolved item does not starve the rest. Runtime reports distinguish source gaps from pending semantic curation. Scheduling is a host concern, not an internal daemon.

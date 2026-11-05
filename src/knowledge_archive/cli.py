@@ -21,6 +21,21 @@ def archive_pending(store, data):
 
 def execute(args):
     store = Store(args.root)
+    if args.command == "sync-x":
+        from .adapters.x.capture import ChromeDevTools
+        from .adapters.x.sync import sync
+
+        return sync(
+            store,
+            ChromeDevTools(args.devtools_command),
+            max_entries=args.max_entries,
+            max_seconds=args.max_seconds,
+            max_pages=args.max_pages,
+            max_scrolls=args.max_scrolls,
+            scan_scrolls=args.scan_scrolls,
+            max_total_scrolls=args.max_total_scrolls,
+            resume=args.resume,
+        )
     if args.command == "migrate-x":
         from .adapters.x.migrate import migrate
 
@@ -121,6 +136,15 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ["check", "pending", "build", "fetch", "audit", "migrate-x"]:
         sub.add_parser(name)
+    p = sub.add_parser("sync-x")
+    p.add_argument("--max-entries", type=int, default=20)
+    p.add_argument("--max-seconds", type=int, default=900)
+    p.add_argument("--max-pages", type=int, default=8)
+    p.add_argument("--max-scrolls", type=int, default=6)
+    p.add_argument("--scan-scrolls", type=int, default=30)
+    p.add_argument("--max-total-scrolls", type=int, default=80)
+    p.add_argument("--resume", metavar="RUN_ID")
+    p.add_argument("--devtools-command", nargs="+", default=["chrome-devtools"])
     p = sub.add_parser("watermark")
     p.add_argument("--collection", default="likes")
     p = sub.add_parser("ingest-x")

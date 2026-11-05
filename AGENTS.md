@@ -6,5 +6,5 @@
 - Use stable IDs and explicit reply edges. Author handles, page order, timestamps, and text similarity cannot establish a reply relationship.
 - Preserve original content and rich-text semantics. AI interpretation must remain separate from source evidence.
 - No changes to a user's likes, reposts, follows, or posts are needed for capture.
-- Run Python 3.11+ tests with `PYTHONPATH=src python3 -B -m unittest discover -s tests -v` and browser-parser tests with `node --test tests/test_x_reader.cjs`.
-- The core, migration, and bounded single-thread capture are implemented. Account-feed discovery and unattended scheduling remain unimplemented; do not advertise full account sync.
+- Run Python 3.11+ tests with `PYTHONPATH=src python3 -B -m unittest discover -s tests -v` and browser-parser tests with `node --test tests/*.cjs`.
+- The core, migration, account discovery, and bounded resumable sync are implemented. Scheduling and semantic curation belong to the host Agent; never advertise platform completeness.

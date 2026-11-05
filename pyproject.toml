@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "knowledge-archive-engine"
-version = "0.1.0"
-description = "Auditable local knowledge archives with source-specific capture adapters"
+name = "loom-of-threads"
+version = "0.2.0"
+description = "Loom of Threads: weave fragmented threads into auditable knowledge"
 requires-python = ">=3.11"
 dependencies = []
 license = { file = "LICENSE" }
@@ -18,4 +18,5 @@ where = ["src"]
 "knowledge_archive.adapters.x" = ["*.js"]
 
 [project.scripts]
+loom = "knowledge_archive.cli:main"
 knowledge-archive = "knowledge_archive.cli:main"

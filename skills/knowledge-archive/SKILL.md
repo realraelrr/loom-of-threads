@@ -1,9 +1,9 @@
 ---
 name: knowledge-archive
-description: 维护使用 knowledge-archive-engine 的本地知识库，导入 X 连续推文和混合媒体、整理标签与综述、复核时效并构建离线索引。仅用于包含 archive.toml 和 raw/archive.json 的知识库。
+description: 维护 Loom of Threads本地知识库，导入 X 连续推文和混合媒体、整理标签与综述、复核时效并构建离线索引。仅用于包含 archive.toml 和 raw/archive.json 的知识库。
 ---
 
-# Knowledge Archive
+# Loom of Threads · 知识库维护
 
 先读目标知识库的 AGENTS.md 和 archive.toml。引擎运行代码与个人数据分离；本技能不包含账号或机器路径。以下命令在知识库根目录运行，使用该项目安装的 `knowledge-archive`（uv 项目可用 `uv run knowledge-archive`）。
 
@@ -18,7 +18,8 @@ description: 维护使用 knowledge-archive-engine 的本地知识库，导入 X
 
 1. `check`、`pending`、`watermark --collection likes`：从真实状态确定待办，不依赖上次聊天记忆。水位线是近期入口集合，不是“遇到一个 ID 就肯定采完”的证明。
 2. 采集 X 时使用官方 Chrome DevTools CLI/MCP 连接已登录浏览器。先确认连接；不导出 Cookie。页面编号仅会话内有效。页面异常可用 Computer Use 检查，但原文和媒体应由结构化采集器落盘。
-3. 对明确的 X 入口运行：
+3. 账户更新先运行 `knowledge-archive sync-x --max-entries 20 --max-seconds 900`，可用 `--devtools-command node /path/to/chrome-devtools.js` 指定官方 CLI。核对报告中的 discoveries、failures、needs_curation 和 pending_counts；退出码 2 表示 partial。中断使用 `--resume RUN_ID`；正常下一周期创建新 run，保留 `raw/sync-state.json` 的扫描基线与历史尝试次数，以及 `.archive/sync/` 的抓取断点。不删除待办规避错误。
+   对明确的 X 入口也可运行：
    ```sh
    uv run python -m knowledge_archive.adapters.x.capture POST_ID --output .archive/captures/UNIQUE_RUN --max-pages 12 --max-scrolls 6
    ```
@@ -36,6 +37,8 @@ description: 维护使用 knowledge-archive-engine 的本地知识库，导入 X
 
 读 view/README.md 分类导航；使用 SQLite 的 entries、records、members 表。entries 是收录入口，records 含补全节点与引用。中文关键词用 LIKE；摘要细节以原文和媒体证据为准。
 
-## 自动运行的当前限制
+## 定时运行
 
-当前已支持明确帖子 ID 的有界采集与恢复。点赞、书签、转发列表的完整发现与调度尚未实现为引擎命令；不要把定时运行单帖探针宣称为账户增量同步。无人值守部署前先验收来源列表扫描、登录状态、预算与中断恢复。遇到需要人工处理的登录或页面变化时报告，不改账号设置、点赞、转发或关注状态。
+调度由宿主提供，默认每轮20条、15分钟采集预算；历史记录按尝试次数轮转，失败不饿死后续记录。预算与覆盖范围不是“全部完成”的证明。运行后完成未分类条目、必要综述更新、fetch/build，并报告新增数量、补全结果和仍有缺口的数量。不要自动发布私有数据到 GitHub，不修改引擎代码，不改账号设置、点赞、转发或关注状态。
+
+遇到需要人工处理的登录、错误账号或页面变化，停止受影响的采集并报告；可继续整理已保存证据。电脑与宿主应用需保持运行，Chrome需可连接且已登录。保留用户已有标签页与共享浏览器daemon；只清理自己创建的资源。Note Tweet内嵌媒体布局若无法定位则保留partial，不猜位置。

@@ -150,37 +150,53 @@ def article_blocks(article, assets, tid, legacy=False):
                 "alt": "文章配图",
             }
         elif info["__typename"] in ("ApiVideo", "ApiAnimatedGif") or "variants" in info:
-            thumb = info["preview_image"]["original_img_url"]
-            url = mp4(info["variants"], info.get("duration_millis"))
+            try:
+                url = mp4(info.get("variants") or [], info.get("duration_millis"))
+            except ValueError:
+                issues.append(f"missing_article_video_variants:{mid}")
+                continue
             media[mid] = {
                 "kind": "video",
                 "asset": asset(
                     assets, url, "video", f"article_{tid}_{mid}.mp4" if legacy else None
                 ),
-                "poster": asset(
+            }
+            thumb = (info.get("preview_image") or {}).get("original_img_url")
+            if thumb:
+                media[mid]["poster"] = asset(
                     assets,
                     thumb,
                     "image",
                     image_filename(thumb, f"article_{tid}_{mid}_thumb")
                     if legacy
                     else None,
-                ),
-            }
+                )
         else:
             issues.append(f"unsupported_article_media:{info['__typename']}")
     state = article.get("content_state")
     if not state or not state.get("blocks"):
         return blocks, ["missing_article_body", *issues]
     entity_map = {str(e["key"]): e["value"] for e in state.get("entityMap") or []}
+    referenced_media = set()
     for block in state["blocks"]:
         kind = block.get("type", "unstyled")
         if kind == "atomic":
-            for ref in block.get("entityRanges") or []:
-                ent = entity_map[str(ref["key"])]
+            refs = block.get("entityRanges") or []
+            if not refs:
+                issues.append("missing_article_atomic_entity")
+            for ref in refs:
+                ent = entity_map.get(str(ref["key"]))
+                if ent is None:
+                    issues.append(f"missing_article_entity:{ref['key']}")
+                    continue
                 typ, data = ent["type"], ent.get("data", {})
                 if typ == "MEDIA":
-                    for item in data.get("mediaItems") or []:
+                    items = data.get("mediaItems") or []
+                    if not items:
+                        issues.append("missing_article_media_items")
+                    for item in items:
                         mid = str(item["mediaId"])
+                        referenced_media.add(mid)
                         if mid in media:
                             blocks.append(media[mid])
                         else:
@@ -222,6 +238,13 @@ def article_blocks(article, assets, tid, legacy=False):
             issues.append(f"unsupported_article_block:{kind}")
             prefix = ""
         blocks.append({"kind": "markdown", "text": prefix + text})
+    # Keep available assets when the layout is incomplete, without inventing
+    # their position in the body. The issue distinguishes this attachment tail
+    # from media placed by an explicit Draft.js MEDIA entity.
+    for mid in media:
+        if mid not in referenced_media:
+            issues.append(f"unplaced_article_media:{mid}")
+            blocks.append(media[mid])
     return blocks, issues
 
 

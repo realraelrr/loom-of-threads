@@ -1,6 +1,8 @@
-# Knowledge Archive Engine
+# Loom of Threads · 线程的织机
 
-可审计的本地 AI 知识库引擎。Agent 负责知识判断，程序负责来源转换、校验、媒体、持久化与发布。个人账号、分类、正文与媒体保留在独立知识库中。
+把信息流里的碎片，织成可追溯、可检索、可供 AI 整理与消费的知识。
+
+Loom of Threads 是可审计的本地 AI 知识库引擎。Agent 负责知识判断，程序负责来源转换、校验、媒体、持久化与发布。个人账号、分类、正文与媒体保留在独立知识库中。
 
 ## 当前能力
 
@@ -12,7 +14,9 @@
 - 媒体哈希验证、下载主机白名单、不可变构建版本和原子发布指针。
 - SQLite `entries`、`records`、`members` 三张表，以及 Markdown 阅读视图。
 
-**尚未实现账户级来源列表的自动扫描与调度。** 单帖采集不是完整点赞/转发同步。也不承诺恢复 X 已删除、隐藏或无权查看的内容。`observed` 仅描述本次可见范围；`partial` 和预算耗尽必须作为缺口保留。
+支持已登录账号点赞、转发列表的有界增量扫描和历史补全；需要 Agent 完成分类与综述后再发布。调度由 Codex 等宿主承担。不能恢复 X 已删除、隐藏或无权查看的内容。`observed` 仅描述本次可见范围；`partial` 和预算耗尽必须作为缺口保留。
+
+Python 包名为 `loom-of-threads`，主命令为 `loom`；已有 `knowledge-archive` 命令暂保留为同一入口，旧脚本可继续使用。
 
 ## 安装与离线演示
 
@@ -22,8 +26,8 @@
 uv venv --python 3.13
 uv pip install .
 cp -R examples/demo /tmp/knowledge-archive-demo
-.venv/bin/knowledge-archive --root /tmp/knowledge-archive-demo check
-.venv/bin/knowledge-archive --root /tmp/knowledge-archive-demo build
+.venv/bin/loom --root /tmp/knowledge-archive-demo check
+.venv/bin/loom --root /tmp/knowledge-archive-demo build
 ```
 
 演示内容全部为合成样本，无需浏览器、账号或网络。阅读 `/tmp/knowledge-archive-demo/view/README.md`。
@@ -31,18 +35,42 @@ cp -R examples/demo /tmp/knowledge-archive-demo
 ## 知识库操作
 
 ```sh
-knowledge-archive --root /path/to/archive check
-knowledge-archive --root /path/to/archive pending
-knowledge-archive --root /path/to/archive label ENTRY_ID --l2 1.1 --ttl tactical --status active
-knowledge-archive --root /path/to/archive synthesis 1.1 /path/to/bullets.json
-knowledge-archive --root /path/to/archive audit
-knowledge-archive --root /path/to/archive fetch
-knowledge-archive --root /path/to/archive build
+loom --root /path/to/archive check
+loom --root /path/to/archive pending
+loom --root /path/to/archive label ENTRY_ID --l2 1.1 --ttl tactical --status active
+loom --root /path/to/archive synthesis 1.1 /path/to/bullets.json
+loom --root /path/to/archive audit
+loom --root /path/to/archive fetch
+loom --root /path/to/archive build
 ```
 
 所有正式变更写进 `raw/archive.json`；证据位于 `raw/evidence/`，媒体位于 `media/`。构建先在 `.archive/builds/` 完整生成，再切换 `view`。失败保留上一版本。`media/` 需要独立备份，远程 URL 不是永久备份。
 
 当前使用单机写锁，并检查源文件变化以避免覆盖人工编辑；不要让多台机器同时修改同一云盘目录。
+
+## X 账户同步
+
+在实例的 `archive.toml` 中设置：
+
+```toml
+[sources.x]
+profile = "your_handle"
+collections = ["likes", "reposts"]
+```
+
+连接浏览器后执行：
+
+```sh
+loom --root /path/to/archive sync-x --max-entries 20 --max-seconds 900
+# 同一运行被中断时，使用报告中的 run_id：
+loom --root /path/to/archive sync-x --resume RUN_ID
+```
+
+扫描核对当前登录账号，依据显式点赞/转发状态收录；普通自发帖、推荐广告和其他人的回复不会因此成为收藏。扫描证据保存于 `raw/evidence/discovery/`，权威扫描进度在 `raw/sync-state.json`，运行明细与可恢复抓取在 `.archive/sync/`。缺口基线与每条尝试次数跨运行保留，防止部分扫描推进水位后漏抓，也防止一个失败条目阻塞所有历史记录。
+
+`sync-x` 报告新内容和 `needs_curation`，不替 Agent 编造标签或综述。接着按维护 Skill 整理，运行 `fetch` 和 `build`。预算到期退出码 2 表示仍有待办；登录失效、账号不符、页面变化应检查报告，不能宣称同步完整。列表静止不能证明账户历史完整。定期运行应保留 `raw/sync-state.json` 和 `.archive/sync/`；前者随真源备份，后者用于精确断点恢复，不要每次删进度重来。
+
+真实验收覆盖点赞列表与账户匹配、无转发时不误收普通帖；转发正样本目前由合成测试覆盖。Note Tweet 的 `inline_media` 非空布局仍缺真实协议样本，保留明确缺口；X Articles 图文位置已支持。
 
 ## X 单帖与线程采集
 
@@ -53,7 +81,7 @@ python -m knowledge_archive.adapters.x.capture POST_ID \
 # 中断或预算耗尽后恢复同一目录：
 python -m knowledge_archive.adapters.x.capture POST_ID \
   --output /path/to/private/capture --resume
-knowledge-archive --root /path/to/archive ingest-x /path/to/private/capture
+loom --root /path/to/archive ingest-x /path/to/private/capture
 ```
 
 可用 `--devtools-command node /path/to/chrome-devtools.js` 指定已安装的官方 CLI。探针不自动重启共享 daemon，只关闭自己新开的标签页。它不点赞、转发、关注，不读取或导出 Cookie。
@@ -65,9 +93,9 @@ knowledge-archive --root /path/to/archive ingest-x /path/to/private/capture
 先备份并停止旧写入任务。为实例创建 archive.toml（参考 examples/demo，X 媒体通常配置 pbs.twimg.com 与 video.twimg.com）。
 
 ```sh
-knowledge-archive --root /path/to/old-archive migrate-x
-knowledge-archive --root /path/to/old-archive check
-knowledge-archive --root /path/to/old-archive build
+loom --root /path/to/old-archive migrate-x
+loom --root /path/to/old-archive check
+loom --root /path/to/old-archive build
 ```
 
 迁移不覆盖已有新格式库。旧 JSON 保留作证据；确认新视图后，可将它们移到 raw/evidence/legacy，并更新实例维护契约。旧 tweets 表查询应改为 entries/records；文章文件名改用稳定记录身份。开发期可用本地包路径绑定实例，发布后固定版本。云盘可能给 `.pth` 标记隐藏属性，因此建议普通包安装而非 editable 安装。
