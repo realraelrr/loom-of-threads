@@ -108,3 +108,7 @@ node --test tests/test_x_reader.cjs
 ```
 
 [维护 Skill](skills/knowledge-archive/SKILL.md) 不含机器路径和账号，可安装到 Agent 的技能目录。[架构与数据边界](docs/architecture.md) 说明真源、证据和发布之间的关系。
+
+## 在新会话中检索
+
+安装 `skills/knowledge-search` 为独立只读检索 Skill；`skills/knowledge-archive` 负责写入和维护。两者从本机 `~/.config/loom-of-threads/config.json` 的 `default_archive` 读取默认库路径，例如 `{"default_archive":"/path/to/private/archive"}`。配置不应提交到公共仓库。之后可直接说“从本地知识库查找 XXX”；无法自动选择时显式使用 `$knowledge-search`。检索脚本用 SQLite 只读连接，支持中文子串与多个关键词，不依赖浏览器。

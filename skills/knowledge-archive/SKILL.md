@@ -1,11 +1,11 @@
 ---
 name: knowledge-archive
-description: 维护 Loom of Threads本地知识库，导入 X 连续推文和混合媒体、整理标签与综述、复核时效并构建离线索引。仅用于包含 archive.toml 和 raw/archive.json 的知识库。
+description: 增加、更新和维护 Loom of Threads 本地知识库，采集导入、修改分类和综述、处理失效或重复条目、下载媒体并构建索引。纯检索和找素材使用 knowledge-search。
 ---
 
 # Loom of Threads · 知识库维护
 
-先读目标知识库的 AGENTS.md 和 archive.toml。引擎运行代码与个人数据分离；本技能不包含账号或机器路径。以下命令在知识库根目录运行，使用该项目安装的 `knowledge-archive`（uv 项目可用 `uv run knowledge-archive`）。
+用户未指定库时，读取 `~/.config/loom-of-threads/config.json` 的 `default_archive`；未配置则检查当前目录是否为知识库，仍无法定位才询问。先读目标知识库的 AGENTS.md 和 archive.toml。引擎运行代码与个人数据分离；本技能不包含账号或机器路径。以下命令在知识库根目录运行，使用该项目安装的 `knowledge-archive`（uv 项目可用 `uv run knowledge-archive`）。
 
 ## 维护边界
 
@@ -33,9 +33,9 @@ description: 维护 Loom of Threads本地知识库，导入 X 连续推文和混
 6. 新内容改变结论时，用 `synthesis L2 JSON_FILE` 更新该分类的字符串数组。`[#ENTRY_ID]` 引用同分类入口；区分作者意见、可核实事实、适用条件，不把同源重复帖子当独立证据。
 7. `fetch` 完成媒体校验，`build` 发布一致版本。失败保留旧阅读版本；已经抓到的原文无需重新采集。`audit` 输出到期复核项。
 
-## 检索
+## 修改与删除
 
-读 view/README.md 分类导航；使用 SQLite 的 entries、records、members 表。entries 是收录入口，records 含补全节点与引用。中文关键词用 LIKE；摘要细节以原文和媒体证据为准。
+新增通过采集/导入；修改通过 label/synthesis 命令。失效或重复使用 label 的 expired/duplicate 状态并写 note，保留证据。当前引擎无物理删除命令；不要把“删除”擅自解释为失效，也不要直接删 raw、媒体或数据库行。用户要求物理删除时先明确具体入口、关联共享节点和证据保留范围，再按该范围实现专门操作。
 
 ## 定时运行
 
