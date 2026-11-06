@@ -40,6 +40,27 @@ def validate(data, store=None):
     for field in ["records", "entries", "assets", "synthesis"]:
         if not isinstance(data.get(field), dict):
             raise ValueError(f"{field} must be an object")
+    deleted = data.get("deleted_entries", {})
+    if not isinstance(deleted, dict):
+        raise ValueError("deleted_entries must be an object")
+    deleted_sources = set()
+    for eid, item in deleted.items():
+        if not isinstance(eid, str) or not ID.fullmatch(eid) or not isinstance(item, dict):
+            raise ValueError("Invalid deleted entry")
+        for field in ("source", "source_id", "record_id", "reason"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise ValueError(f"Invalid deleted entry {field}: {eid}")
+        require(bool(ID.fullmatch(item["record_id"])), f"Invalid deleted record ID: {eid}")
+        timestamp(item.get("deleted_at"))
+        require(eid not in data["entries"], f"Deleted entry still active: {eid}")
+        identity = (item["source"], item["source_id"])
+        deleted_sources.add(identity)
+    for eid, entry in data["entries"].items():
+        record = data["records"].get(entry.get("record_id"), {}) if isinstance(entry, dict) else {}
+        require(
+            (record.get("source"), record.get("source_id")) not in deleted_sources,
+            f"Deleted source still has an entry: {eid}",
+        )
     taxonomy = data.get("taxonomy")
     if not isinstance(taxonomy, list):
         raise ValueError("taxonomy must be a list")

@@ -70,6 +70,8 @@ loom --root /path/to/archive sync-x --resume RUN_ID
 
 `sync-x` 报告新内容和 `needs_curation`，不替 Agent 编造标签或综述。接着按维护 Skill 整理，运行 `fetch` 和 `build`。预算到期退出码 2 表示仍有待办；登录失效、账号不符、页面变化应检查报告，不能宣称同步完整。列表静止不能证明账户历史完整。定期运行应保留 `raw/sync-state.json` 和 `.archive/sync/`；前者随真源备份，后者用于精确断点恢复，不要每次删进度重来。
 
+未完成采集按原因冷却，报告的 `deferred` 保留失败原因、细节及 `next_retry_at`。临时错误按 1/3/7/14 天退避，预算缺口按 7/14/30 天，来源暂不可见按 14/30 天，提取问题和进度诊断按 30 天复核；这些是调度策略，不代表来源永久失效或到期必能恢复。新发现优先于历史重试。提取问题先检查保留的观察 JSON：修复解析后可重新 `ingest-x`，缺少源字段则需要新观察；相关提取规则变更会提前解除提取冷却。修复登录、解析或调整有依据的预算后，可用 `sync-x --resume RUN_ID` 提前恢复。累计 `max_total_scrolls` 已耗尽的 checkpoint 不会因时间过去自动获得新预算，应先检查缺口，再显式提高 `--max-total-scrolls`；不要删 checkpoint 或无限增加预算。
+
 真实验收覆盖点赞列表与账户匹配、独立转帖列表和转发事件到原帖的解析。转发事件 ID 与原帖 ID 分开保存，同一内容因点赞和转发收录时共享一个入口。Note Tweet 的 `inline_media` 非空布局仍缺真实协议样本，保留明确缺口；X Articles 图文位置已支持。
 
 ## X 单帖与线程采集
@@ -106,11 +108,28 @@ loom --root /path/to/old-archive build
 
 ```sh
 PYTHONPATH=src python3 -B -m unittest discover -s tests -v
-node --test tests/test_x_reader.cjs
+node --test tests/*.cjs
 ```
 
 [维护 Skill](skills/knowledge-archive/SKILL.md) 不含机器路径和账号，可安装到 Agent 的技能目录。[架构与数据边界](docs/architecture.md) 说明真源、证据和发布之间的关系。
 
 ## 在新会话中检索
 
-安装 `skills/knowledge-search` 为独立只读检索 Skill；`skills/knowledge-archive` 负责写入和维护。两者从本机 `~/.config/loom-of-threads/config.json` 的 `default_archive` 读取默认库路径，例如 `{"default_archive":"/path/to/private/archive"}`。配置不应提交到公共仓库。之后可直接说“从本地知识库查找 XXX”；无法自动选择时显式使用 `$knowledge-search`。检索脚本用 SQLite 只读连接，支持中文子串与多个关键词，不依赖浏览器。
+安装 `skills/knowledge-search` 为独立只读检索 Skill；`skills/knowledge-archive` 负责写入和维护。这些 Skill 从本机 `~/.config/loom-of-threads/config.json` 的 `default_archive` 读取默认库路径，例如 `{"default_archive":"/path/to/private/archive"}`。配置不应提交到公共仓库。之后可直接说“从本地知识库查找 XXX”；无法自动选择时显式使用 `$knowledge-search`。检索脚本用 SQLite 只读连接，支持中文子串与多个关键词，不依赖浏览器。
+
+
+## 审核后清理
+
+[清理 Skill](skills/knowledge-cleanup/SKILL.md) 负责提出过时、重复或低质量条目的清单；用户确认具体条目、理由与关联修改后才执行删除。维护、检索和清理三个 Skill 均在本仓库版本控制，不含个人数据。可将技能目录链接或安装到宿主的 skills 目录。
+
+```sh
+loom cleanup-preview /path/to/request.json --output /path/to/plan.json
+# 用户审核计划并确认后，使用预览返回的 token：
+loom cleanup-apply /path/to/plan.json --approve APPROVAL_TOKEN
+loom check
+loom build
+```
+
+请求至少包含 `{"entries":[{"entry_id":"ENTRY_ID","reason":"理由"}]}`；如有综述或 note 引用，需显式提供替换文字，详见清理 Skill。计划绑定库路径、真源版本与完整影响，真源变化后必须重新预览；token 只能绑定计划，不能代替人的确认。
+
+此操作移除当前真源中的入口和不再被其他记录依赖的关联内容，保留共享来源。它保留不可变证据、媒体物理文件、历史发布版本与 `.archive/cleanup/` 操作前快照，不是磁盘彻底擦除，也不会操作 X 的点赞或转发。`deleted_entries` 保存来源身份与理由，阻止同步或手动导入自动重建已删入口；其他入口仍可引用该来源。该字段随 `raw/archive.json` 备份。尚无撤销删除命令，不要通过手改删除记录绕过决策；恢复需单独明确范围。

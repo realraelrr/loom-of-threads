@@ -169,6 +169,11 @@ def ingest(store, capture_dir, collection="likes"):
     selected_rid = "x:" + selected
     with store.writer():
         data, expected = store.snapshot()
+        if any(
+            deleted["source"] == "x" and deleted["source_id"] == selected
+            for deleted in data.get("deleted_entries", {}).values()
+        ):
+            raise ValueError("Selected X source is suppressed by a local entry deletion")
         # Preserve legacy citation IDs only when they identify this exact source.
         matching = [
             eid for eid, e in data["entries"].items() if e["record_id"] == selected_rid
@@ -193,20 +198,11 @@ def ingest(store, capture_dir, collection="likes"):
             and existing_selected.get("observed_at")
             and selected_time < timestamp(existing_selected["observed_at"])
         )
-        if stale_selected and entry is not None:
-            entry["collections"] = collections
-            validate(data, store)
-            _save_evidence(store, fingerprint, payloads)
-            store.save(data, expected)
-            return {
-                "entry": eid,
-                "ignored_stale": True,
-                "capture_state": entry["capture_state"],
-            }
         unresolved = [*global_issues, *missing_references]
-        if stale_selected:
+        if stale_selected and entry is None:
             needed = {selected}
             unresolved.append("older_selection_observation")
+        merged_records = 0
         for tid in sorted(needed):
             rid = "x:" + tid
             source = chosen[tid]
@@ -241,8 +237,22 @@ def ingest(store, capture_dir, collection="likes"):
                     continue
             candidate["observed_at"] = ranks[tid][2].isoformat().replace("+00:00", "Z")
             candidate["evidence"] = f"raw/evidence/captures/{fingerprint}"
+            merged_records += candidate != existing
             data["records"][rid] = candidate
             data["assets"] = candidate_assets
+        if stale_selected and entry is not None:
+            # Record observations have independent clocks. The older selection
+            # cannot revise entry membership or clear its newer capture gaps.
+            entry["collections"] = collections
+            validate(data, store)
+            _save_evidence(store, fingerprint, payloads)
+            store.save(data, expected)
+            return {
+                "entry": eid,
+                "ignored_stale": True,
+                "merged_records": merged_records,
+                "capture_state": entry["capture_state"],
+            }
         members = (
             [selected_rid]
             if stale_selected

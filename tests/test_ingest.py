@@ -231,6 +231,153 @@ class IngestTests(unittest.TestCase):
             self.store.load()["entries"]["x:100"]["last_captured_at"], before
         )
 
+    def add_observation(self, capture, name, records, observed):
+        observation = {
+            "schema_version": 1,
+            "observed_at": observed,
+            "page_url": "https://x.com/example/status/" + records[0]["id"],
+            "page_state": "content",
+            "visible_ids": [record["id"] for record in records],
+            "records": records,
+            "issues": [],
+        }
+        (capture / name).write_text(json.dumps(observation))
+        report = json.loads((capture / "report.json").read_text())
+        report["observation_files"].append(name)
+        (capture / "report.json").write_text(json.dumps(report))
+
+    def test_old_selection_merges_scoped_records_without_revising_entry(self):
+        root = source("new root")
+        root.update(quoted_id="200", reply_to_id="50", reply_to_author_id="2")
+        context = source("context")
+        context["id"] = "50"
+        context["author"]["id"] = "2"
+        member = source("new member")
+        member.update(id="101", reply_to_id="100", reply_to_author_id="1")
+        new = self.capture("new", root)
+        self.add_observation(new, "thread.json", [context, member], "2026-11-05T00:00:00Z")
+        ingest(self.store, new)
+        before = self.store.load()
+
+        old_root = source("old root")
+        old_root["quoted_id"] = "200"
+        old = self.capture("old", old_root, observed="2026-01-01T00:00:00Z")
+        old_member = source("historical member")
+        old_member.update(id="102", reply_to_id="100", reply_to_author_id="1")
+        reference = source("newly observed reference")
+        reference.update(id="200", quoted_id="300")
+        nested = source("outside one-edge scope")
+        nested["id"] = "300"
+        unrelated = source("unrelated visible post")
+        unrelated["id"] = "999"
+        self.add_observation(
+            old, "references.json", [old_member, reference, nested, unrelated],
+            "2026-11-06T00:00:00Z",
+        )
+        result = ingest(self.store, old, "reposts")
+        data = self.store.load()
+        expected_entry = deepcopy(before["entries"]["x:100"])
+        expected_entry["collections"].append("reposts")
+        self.assertEqual(data["entries"]["x:100"], expected_entry)
+        self.assertEqual(data["records"]["x:100"], before["records"]["x:100"])
+        self.assertEqual(set(data["records"]), {"x:50", "x:100", "x:101", "x:102", "x:200"})
+        self.assertEqual(data["records"]["x:200"]["observed_at"], "2026-11-06T00:00:00Z")
+        self.assertEqual(result["merged_records"], 2)
+        self.assertEqual(result["capture_state"], "partial")
+        self.assertIn("100:missing_reference:200", expected_entry["capture_issues"]["content"])
+        before_replay = digest(self.store.path)
+        self.assertEqual(ingest(self.store, old, "reposts")["merged_records"], 0)
+        self.assertEqual(digest(self.store.path), before_replay)
+
+    def test_old_selection_uses_each_reference_observation_time(self):
+        root = source(article=article_with_tweets("200", "300"))
+        new = self.capture("new", root)
+        older_reference = source("older reference")
+        older_reference["id"] = "200"
+        newer_reference = source("newer reference")
+        newer_reference["id"] = "300"
+        self.add_observation(new, "older.json", [older_reference], "2026-11-04T00:00:00Z")
+        self.add_observation(new, "newer.json", [newer_reference], "2026-11-07T00:00:00Z")
+        ingest(self.store, new)
+        before = self.store.load()
+        old_root = source(article=article_with_tweets("200", "300", "400"))
+        old = self.capture("old", old_root, observed="2026-01-01T00:00:00Z")
+        older_reference["text"] = "updated reference"
+        newer_reference["text"] = "obsolete reference"
+        historical_reference = source("reference removed from the newer root")
+        historical_reference["id"] = "400"
+        self.add_observation(
+            old, "references.json", [older_reference, newer_reference, historical_reference],
+            "2026-11-06T00:00:00Z",
+        )
+        result = ingest(self.store, old)
+        data = self.store.load()
+        self.assertEqual(result["merged_records"], 2)
+        self.assertEqual(data["records"]["x:200"]["blocks"][0]["text"], "updated reference")
+        self.assertEqual(data["records"]["x:300"], before["records"]["x:300"])
+        self.assertIn("x:400", data["records"])
+        self.assertEqual(data["records"]["x:100"], before["records"]["x:100"])
+        self.assertEqual(data["entries"], before["entries"])
+
+    def test_old_selection_rejects_identity_conflicts_atomically(self):
+        root = source(article=article_with_tweets("200"))
+        reference = source("known reference")
+        reference["id"] = "200"
+        new = self.capture("new", root)
+        self.add_observation(new, "reference.json", [reference], "2026-11-05T00:00:00Z")
+        ingest(self.store, new)
+        before = digest(self.store.path)
+        evidence_before = set((self.store.root / "raw/evidence/captures").iterdir())
+        for conflicting_id in ("100", "200"):
+            with self.subTest(conflicting_id=conflicting_id):
+                old_root, old_reference = deepcopy(root), deepcopy(reference)
+                (old_root if conflicting_id == "100" else old_reference)["author"]["id"] = "2"
+                old = self.capture("old-" + conflicting_id, old_root, observed="2026-01-01T00:00:00Z")
+                self.add_observation(old, "reference.json", [old_reference], "2026-01-01T00:00:00Z")
+                with self.assertRaisesRegex(ValueError, "changed author identity"):
+                    ingest(self.store, old)
+                self.assertEqual(digest(self.store.path), before)
+                self.assertEqual(set((self.store.root / "raw/evidence/captures").iterdir()), evidence_before)
+
+    def test_old_selection_rejects_new_reference_relationship_conflict(self):
+        root = source(article=article_with_tweets("200"))
+        reference = source("known reference")
+        reference["id"] = "200"
+        new = self.capture("new", root)
+        self.add_observation(new, "reference.json", [reference], "2026-11-05T00:00:00Z")
+        ingest(self.store, new)
+        before = digest(self.store.path)
+        old = self.capture("old", root, observed="2026-01-01T00:00:00Z")
+        reference.update(reply_to_id="999", reply_to_author_id="2")
+        self.add_observation(old, "reference.json", [reference], "2026-11-06T00:00:00Z")
+        with self.assertRaisesRegex(ValueError, "Confirmed reply relationship changed"):
+            ingest(self.store, old)
+        self.assertEqual(digest(self.store.path), before)
+
+    def test_old_selection_partial_reference_does_not_replace_full_record(self):
+        root = source(article=article_with_tweets("200", "300"))
+        reference = source("full reference")
+        reference["id"] = "200"
+        new = self.capture("new", root)
+        self.add_observation(new, "reference.json", [reference], "2026-11-05T00:00:00Z")
+        ingest(self.store, new)
+        before = self.store.load()
+        old = self.capture("old", root, observed="2026-01-01T00:00:00Z")
+        partial = source(article={
+            "title": "preview",
+            "cover_media": {"media_info": {"original_img_url": "https://pbs.twimg.com/new.jpg"}},
+        })
+        partial["id"] = "200"
+        missing = source(text=None)
+        missing["id"] = "300"
+        self.add_observation(old, "partial.json", [partial, missing], "2026-11-06T00:00:00Z")
+        ingest(self.store, old)
+        data = self.store.load()
+        self.assertEqual(data["records"]["x:200"], before["records"]["x:200"])
+        self.assertEqual(data["assets"], before["assets"])
+        self.assertEqual(data["records"]["x:300"]["coverage"], "partial")
+        self.assertEqual(data["entries"], before["entries"])
+
     def test_rejected_partial_assets_do_not_pollute_store(self):
         ingest(self.store, self.capture("full"))
         partial = source(
@@ -314,6 +461,48 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(
             self.store.load()["entries"]["x:100"]["collections"], ["likes", "reposts"]
         )
+
+    def test_deleted_source_cannot_be_collected_again(self):
+        capture = self.capture("capture")
+        ingest(self.store, capture)
+        data = self.store.load()
+        data["entries"] = {}
+        data["records"] = {}
+        data["deleted_entries"] = {
+            "legacy-100": {
+                "source": "x", "source_id": "100", "record_id": "x:100",
+                "reason": "User requested removal",
+                "deleted_at": "2026-11-06T00:00:00Z",
+            },
+        }
+        self.store.save(data)
+        before = digest(self.store.path)
+        with self.assertRaisesRegex(ValueError, "local entry deletion"):
+            ingest(self.store, capture, "reposts")
+        self.assertEqual(digest(self.store.path), before)
+        self.assertEqual(self.store.load()["entries"], {})
+
+    def test_deleted_source_can_still_be_another_entries_reference(self):
+        data = self.store.load()
+        data["deleted_entries"] = {
+            "legacy-200": {
+                "source": "x", "source_id": "200", "record_id": "x:200",
+                "reason": "Remove collection entry, preserve source relationships",
+                "deleted_at": "2026-11-06T00:00:00Z",
+            },
+        }
+        self.store.save(data)
+        root = source()
+        root["quoted_id"] = "200"
+        reference = source("still needed as a reference")
+        reference["id"] = "200"
+        capture = self.capture("capture", root)
+        self.add_observation(capture, "reference.json", [reference], "2026-11-07T00:00:00Z")
+        ingest(self.store, capture)
+        data = self.store.load()
+        self.assertEqual(set(data["records"]), {"x:100", "x:200"})
+        self.assertEqual(set(data["entries"]), {"x:100"})
+        self.assertIn("legacy-200", data["deleted_entries"])
 
     def test_legacy_entry_id_reused_only_for_same_source(self):
         capture = self.capture("capture")

@@ -9,6 +9,7 @@ import uuid
 from .capture import CaptureError, capture_thread
 from .discover import discover
 from .ingest import ingest
+from .retry import extractor_revision, is_deferred, retry_schedule
 from ...core.model import pending, validate
 from ...core.store import atomic_json, load_json, utcnow
 
@@ -131,6 +132,8 @@ def _run(
     attempts_this_run = 0
     reconciled_requests = 0
     previous_failures = len(run["failures"])
+    candidates = {}
+    revision = extractor_revision()
     stopped = None
     try:
         for collection in collections:
@@ -150,12 +153,18 @@ def _run(
                 if collection in e["collections"]
                 and data["records"][e["record_id"]]["source"] == "x"
             }
+            deleted = {
+                e["source_id"] for e in data.get("deleted_entries", {}).values()
+                if e["source"] == "x"
+            }
+            known.update(deleted)
             scans = state.setdefault("scans", {})
             scan = scans.setdefault(
                 collection, {"known_ids": sorted(known), "depth": 0}
             )
             # Until a scan reaches its old overlap, imported prefix IDs must not
             # become new stopping anchors or a deeper unseen tail is lost forever.
+            # This also applies when that newly imported prefix was later deleted.
             atomic_json(state_path, state)
             evidence = store.root / "raw/evidence/discovery" / run_id
             if not evidence.resolve().is_relative_to(store.root):
@@ -214,6 +223,10 @@ def _run(
                 break
         if stopped is None:
             data = store.load()
+            deleted = {
+                e["source_id"] for e in data.get("deleted_entries", {}).values()
+                if e["source"] == "x"
+            }
             completed = {}
             for entry in data["entries"].values():
                 record = data["records"][entry["record_id"]]
@@ -225,7 +238,8 @@ def _run(
             # saved. Reconcile each collection against current source truth before
             # spending capture budget; scan anchors and attempt history are separate.
             for tid, requested in list(state["pending"].items()):
-                remaining = [c for c in requested if c not in completed.get(tid, set())]
+                remaining = [c for c in requested
+                             if tid not in deleted and c not in completed.get(tid, set())]
                 reconciled_requests += len(requested) - len(remaining)
                 if remaining:
                     state["pending"][tid] = remaining
@@ -243,7 +257,8 @@ def _run(
             }
             for entry in data["entries"].values():
                 record = data["records"][entry["record_id"]]
-                if record["source"] == "x" and entry["capture_state"] != "observed":
+                if (record["source"] == "x" and entry["capture_state"] != "observed"
+                        and record["source_id"] not in deleted):
                     cols = [c for c in entry["collections"] if c in collections]
                     if cols:
                         candidates[record["source_id"]] = list(
@@ -251,18 +266,36 @@ def _run(
                                 [*candidates.get(record["source_id"], []), *cols]
                             )
                         )
-            # Attempt count survives new runs. A broken early item cannot starve
-            # later historical entries, even when each run has a small budget.
+            # New discoveries precede historical retries. Explicit resume can
+            # retry early after a repair; ordinary scheduled runs honor cooldowns.
             queue = sorted(
                 candidates,
                 key=lambda tid: (
                     tid != run.get("active"),
-                    tid not in {f.get("id") for f in run["failures"]},
+                    not (resume is not None and tid in {
+                        f.get("id") for f in run["failures"]
+                    }),
+                    not (tid in state["pending"] and tid not in state["attempts"]),
                     state["attempts"].get(tid, {}).get("count", 0),
                     state["attempts"].get(tid, {}).get("at", ""),
                 ),
             )
             for tid in queue:
+                previous = state["attempts"].get(tid, {})
+                # Existing v1 attempts have no scheduling fields. Derive them
+                # from retained reports when possible, without changing evidence.
+                if (previous and not previous.get("next_retry_at")
+                        and previous.get("status") not in ("observed", "interrupted")
+                        and previous.get("capture")):
+                    old_report = store.root / previous["capture"] / "report.json"
+                    if not old_report.resolve().is_relative_to(runtime.resolve()):
+                        raise ValueError("Capture path escapes sync runtime")
+                    if old_report.is_file():
+                        previous.update(retry_schedule(
+                            load_json(old_report), previous, previous["at"], revision
+                        ))
+                if resume is None and is_deferred(previous, utcnow(), revision):
+                    continue
                 remaining = int(max_seconds - (time.monotonic() - started))
                 if attempts_this_run >= max_entries or remaining < 1:
                     stopped = (
@@ -271,7 +304,6 @@ def _run(
                         else "time_budget"
                     )
                     break
-                previous = state["attempts"].get(tid, {})
                 capture_dir = (
                     store.root / previous["capture"]
                     if previous.get("capture")
@@ -305,6 +337,9 @@ def _run(
                         max_seconds=remaining,
                     )
                     state["attempts"][tid]["status"] = report["status"]
+                    state["attempts"][tid].update(retry_schedule(
+                        report, previous, utcnow(), revision
+                    ))
                     if report["status"] in ("observed", "partial"):
                         for collection in candidates[tid]:
                             ingest(store, capture_dir, collection)
@@ -337,6 +372,9 @@ def _run(
                     subprocess.TimeoutExpired,
                 ) as error:
                     state["attempts"][tid]["status"] = "failed"
+                    state["attempts"][tid].update(retry_schedule(
+                        {"status": "failed", "error": str(error)}, previous, utcnow(), revision
+                    ))
                     run["failures"].append({"id": tid, "error": str(error)})
                     if "login" in str(error).lower():
                         stopped = "login_required"
@@ -365,6 +403,14 @@ def _run(
         run["updated_at"] = utcnow()
         atomic_json(run_path, run)
     outstanding = pending(store.load())
+    deferred = [
+        {"id": tid, **{key: attempt[key] for key in (
+            "failure_reason", "failure_details", "deferred_reason", "next_retry_at"
+        )}}
+        for tid in candidates
+        if (attempt := state["attempts"].get(tid, {}))
+        and is_deferred(attempt, utcnow(), revision)
+    ]
     active_failures = [
         f
         for i, f in enumerate(run["failures"])
@@ -393,6 +439,7 @@ def _run(
         "processed_total": len(run["processed"]),
         "discoveries": run["discoveries"],
         "failures": active_failures,
+        "deferred": deferred,
         "pending_discovered": len(state["pending"]),
         "reconciled_requests": reconciled_requests,
         "pending_counts": {k: len(v) for k, v in outstanding.items()},

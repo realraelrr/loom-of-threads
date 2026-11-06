@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 import sys
 from pathlib import Path
-from .core.store import Store
+from .core.store import Store, atomic_json, load_json
 from .core.model import validate, pending, timestamp
 from .core.build import build
 from .core.assets import fetch_assets, verify_asset
@@ -21,6 +21,21 @@ def archive_pending(store, data):
 
 def execute(args):
     store = Store(args.root)
+    if args.command == "cleanup-preview":
+        from .core.cleanup import preview
+
+        plan = preview(store, load_json(args.request))
+        output = args.output.resolve()
+        if output.is_relative_to(store.root / "raw") or output == store.root / "archive.toml":
+            raise ValueError("Cleanup preview output must not overwrite archive source or evidence")
+        if output.exists():
+            raise ValueError("Cleanup preview output already exists; choose a new plan path")
+        atomic_json(output, plan)
+        return {"plan_file": str(output), **plan}
+    if args.command == "cleanup-apply":
+        from .core.cleanup import apply
+
+        return apply(store, load_json(args.plan), args.approve)
     if args.command == "sync-x":
         from .adapters.x.capture import ChromeDevTools
         from .adapters.x.sync import sync
@@ -136,6 +151,12 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ["check", "pending", "build", "fetch", "audit", "migrate-x"]:
         sub.add_parser(name)
+    p = sub.add_parser("cleanup-preview", help="Preview exact entry removal; retains evidence and media")
+    p.add_argument("request", type=Path)
+    p.add_argument("--output", type=Path, required=True)
+    p = sub.add_parser("cleanup-apply", help="Apply a reviewed plan after human confirmation")
+    p.add_argument("plan", type=Path)
+    p.add_argument("--approve", required=True, help="Exact approval_token from the reviewed plan")
     p = sub.add_parser("sync-x")
     p.add_argument("--max-entries", type=int, default=20)
     p.add_argument("--max-seconds", type=int, default=900)

@@ -327,7 +327,7 @@ class SyncTests(unittest.TestCase):
             report = sync(self.store, object(), max_entries=1)
         self.assertEqual(report["pending_discovered"], 1)
         self.assertEqual(len(report["failures"]), 1)
-        self.run_sync(max_entries=3)
+        self.run_sync(max_entries=3, resume=report["run_id"])
         self.assertIn("reposts", self.store.load()["entries"]["100"]["collections"])
         self.assertEqual(load_json(self.root / "raw/sync-state.json")["pending"], {})
 
@@ -392,6 +392,138 @@ class SyncTests(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(RuntimeError, "Another account sync"):
                 self.run_sync()
+
+    def test_budget_cooldown_preserves_pending_and_checkpoint_until_due(self):
+        def bounded(*args, **kwargs):
+            report = self.capture(*args, **kwargs)
+            report["visits"] = [{"stop_reason": "total_scroll_budget"}]
+            return report
+
+        with (
+            patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-01T00:00:00Z"),
+            patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery),
+            patch("knowledge_archive.adapters.x.sync.capture_thread", side_effect=bounded),
+            patch("knowledge_archive.adapters.x.sync.ingest", side_effect=self.ingest),
+        ):
+            first = sync(self.store, object(), max_entries=3)
+        state = load_json(self.root / "raw/sync-state.json")
+        self.assertEqual(first["deferred"][0]["next_retry_at"], "2026-01-08T00:00:00Z")
+        self.assertEqual(first["deferred"][0]["failure_reason"], "total_scroll_budget")
+        checkpoint = self.root / state["attempts"]["100"]["capture"] / "checkpoint.json"
+        before = checkpoint.read_bytes()
+        with patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-04T00:00:00Z"):
+            cooling = self.run_sync(max_entries=3)
+        self.assertEqual(cooling["processed_this_invocation"], 0)
+        self.assertEqual(cooling["pending_counts"]["need_capture"], 3)
+        self.assertEqual(checkpoint.read_bytes(), before)
+        with patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-08T00:00:00Z"):
+            due = self.run_sync(max_entries=1)
+        self.assertEqual(due["processed_this_invocation"], 1)
+        self.assertEqual(self.seen[-1], ("100", True))
+
+    def test_extraction_deferred_with_recovery_date_and_parser_change_unlocks(self):
+        def broken(*args, **kwargs):
+            report = self.capture(*args, **kwargs)
+            report["extraction_issues"] = [{"record_id": "100", "reason": "missing_text"}]
+            return report
+
+        with (
+            patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-01T00:00:00Z"),
+            patch("knowledge_archive.adapters.x.sync.extractor_revision", return_value="old"),
+            patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery),
+            patch("knowledge_archive.adapters.x.sync.capture_thread", side_effect=broken),
+            patch("knowledge_archive.adapters.x.sync.ingest", side_effect=self.ingest),
+        ):
+            first = sync(self.store, object(), max_entries=3)
+        self.assertEqual(first["deferred"][0]["deferred_reason"], "existing_evidence_needs_review")
+        self.assertEqual(first["deferred"][0]["next_retry_at"], "2026-01-31T00:00:00Z")
+        with (
+            patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-02T00:00:00Z"),
+            patch("knowledge_archive.adapters.x.sync.extractor_revision", return_value="new"),
+        ):
+            second = self.run_sync(max_entries=1)
+        self.assertEqual(second["processed_this_invocation"], 1)
+
+    def test_transient_backoff_caps_and_legacy_attempt_report_is_used(self):
+        from knowledge_archive.adapters.x.retry import retry_schedule
+
+        previous = {}
+        for expected in ("02", "04", "08", "15", "15"):
+            previous = retry_schedule(
+                {"status": "failed", "error": "transport unavailable"},
+                previous, "2026-01-01T00:00:00Z", "revision",
+            )
+            self.assertEqual(previous["next_retry_at"], f"2026-01-{expected}T00:00:00Z")
+        with patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-01T00:00:00Z"):
+            self.run_sync(max_entries=3)
+        state = load_json(self.root / "raw/sync-state.json")
+        for tid, attempt in state["attempts"].items():
+            state["attempts"][tid] = {k: attempt[k] for k in ("count", "at", "capture", "status")}
+        atomic_json(self.root / "raw/sync-state.json", state)
+        with patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-02T00:00:00Z"):
+            report = self.run_sync(max_entries=3)
+        self.assertEqual(report["processed_this_invocation"], 0)
+        self.assertEqual(len(report["deferred"]), 3)
+
+    def test_new_discovery_precedes_unattempted_history_and_cooled_failures(self):
+        with (
+            patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery),
+            patch("knowledge_archive.adapters.x.sync.capture_thread", side_effect=RuntimeError("offline")),
+        ):
+            sync(self.store, object(), max_entries=1)
+
+        def discovery(client, profile, collection, *args, **kwargs):
+            return {"ids": ["102"], "status": "observed", "stop_reason": "known_overlap"}
+
+        self.discovery = discovery
+        report = self.run_sync(max_entries=1)
+        self.assertEqual(self.seen, [("102", False)])
+        self.assertEqual(report["pending_counts"]["need_capture"], 3)
+        self.assertIn("100", [item["id"] for item in report["deferred"]])
+
+    def test_deleted_source_is_suppressed_without_replacing_scan_baseline(self):
+        data = self.store.load()
+        del data["entries"]["100"]
+        data["deleted_entries"] = {"100": {
+            "source": "x", "source_id": "100", "record_id": "x:100",
+            "reason": "user removed", "deleted_at": "2026-01-01T00:00:00Z",
+        }}
+        self.store.save(data)
+        attempts = {"100": {"count": 2, "at": "2026-01-01T00:00:00Z", "status": "failed"}}
+        atomic_json(self.root / "raw/sync-state.json", {
+            "schema_version": 1, "profile": "example", "pending": {"100": ["likes"]},
+            "attempts": attempts, "scans": {"likes": {"known_ids": ["old"], "depth": 4}},
+        })
+        anchors = {}
+
+        def discovery(client, profile, collection, output, known, **kwargs):
+            anchors[collection] = known
+            if collection == "likes":
+                # The deleted item was imported from the incomplete scan's
+                # prefix. Treating it as a new anchor would hide the old tail.
+                if "100" in known:
+                    return {"ids": ["100"], "status": "observed", "stop_reason": "known_overlap"}
+                return {"ids": ["100", "999"], "status": "partial", "stop_reason": "scroll_budget"}
+            return {"ids": ["100"], "status": "partial", "stop_reason": "scroll_budget"}
+
+        self.discovery = discovery
+        self.run_sync(max_entries=3)
+        state = load_json(self.root / "raw/sync-state.json")
+        self.assertEqual(anchors["likes"], {"old"})
+        self.assertEqual(anchors["reposts"], {"100"})
+        self.assertEqual(state["scans"]["likes"], {"known_ids": ["old"], "depth": 4})
+        self.assertEqual(state["attempts"]["100"], attempts["100"])
+        self.assertNotIn("100", state["pending"])
+        self.assertEqual(state["pending"]["999"], ["likes"])
+        self.assertNotIn("100", [tid for tid, _ in self.seen])
+
+    def test_old_attempt_without_report_remains_retryable(self):
+        atomic_json(self.root / "raw/sync-state.json", {
+            "schema_version": 1, "profile": "example", "pending": {},
+            "attempts": {"100": {"count": 4, "at": "2026-01-01T00:00:00Z", "status": "failed"}},
+        })
+        self.run_sync(max_entries=3)
+        self.assertIn(("100", False), self.seen)
 
     def test_legacy_runtime_state_migrates_without_losing_partial_scan_anchor(self):
         legacy = self.root / ".archive/sync/state.json"

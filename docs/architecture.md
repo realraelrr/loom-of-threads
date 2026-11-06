@@ -37,3 +37,18 @@ Discovery verifies the logged-in account, collection route, and explicit viewer 
 ## Reference scope
 
 Capture and ingestion share one reference-scope calculation: author-thread and required parent-context nodes are roots; their explicit quotes, repost targets, and used article TWEET entities are direct references. References inside those referenced records remain links. Reports and entries preserve `reference_depth: 1` and `excluded_reference_edges`. This boundary avoids unbounded traversal into unrelated topics. Missing direct references remain explicit gaps; out-of-scope edges do not imply failed capture. Existing evidence and previously stored deeper records are retained.
+
+
+## Evidence reuse and retries
+
+A stale selected observation cannot replace the entry's latest membership, context, coverage or scope. Associated records may still merge by their own observation timestamps and identity/relationship checks. `ignored_stale` refers to the selected entry decision; `merged_records` reports useful record updates. Imported evidence does not automatically clear an older entry's gaps.
+
+Sync records retry reasons and a bounded cooldown in existing attempt state. New discoveries precede historical retries. Deferred work stays pending with a next retry time; an explicit resume may bypass cooldown after inspection. Extraction issues can require reviewing stored observations before re-ingest; stored extracted JSON is not a replayable DOM. Expired cooldown is permission to attempt, not proof of recoverability or a reset of cumulative scroll budgets.
+
+## Reviewed removal
+
+Cleanup uses preview and apply over a snapshot-bound plan. The host obtains confirmation of the exact entries, reasons, resource impacts and explicit note/synthesis replacements. The approval token binds plan contents, not human identity. Apply re-derives impact under the archive writer lock and rejects changed source or plan contents before mutation.
+
+Removal is limited to selected entries and their dependency closure that no retained record or entry needs. Unrelated orphan records are not opportunistically collected. Shared quote/reply/member/context records and shared media metadata survive. Physical media, immutable evidence, old published generations and an operation snapshot remain; this is active-archive removal, not secure erasure. A subsequent build publishes the new view.
+
+Optional `deleted_entries` in the source snapshot records entry/source identities, reason and time. X discovery and ingest respect these decisions to avoid silently resurrecting deleted collection entries, while retained entries may still need the same source as context. Deletion decisions do not change the external account. Restoring an entry or purging all historical copies is a separate explicitly scoped operation.
