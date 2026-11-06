@@ -86,6 +86,8 @@ loom --root /path/to/archive ingest-x /path/to/private/capture
 
 可用 `--devtools-command node /path/to/chrome-devtools.js` 指定已安装的官方 CLI。探针不自动重启共享 daemon，只关闭自己新开的标签页。它不点赞、转发、关注，不读取或导出 Cookie。
 
+采集范围是作者线程、必要父上下文及它们的直接引用（含文章内嵌推文）。更深的引用保留链接，不递归追踪整张引用网络；报告中的 `reference_depth: 1` 与 `excluded_reference_edges` 明确这个边界。直接引用正文缺失仍标记 partial。
+
 每次观察原文直接落盘，Agent 只接收报告；不需要逐字转写 JSON。检查 `status`、`pending_page_ids`、`extraction_issues`、各访问的 `stop_reason`。只对明确的展开回复按钮进行点击，不点击泛化“更多”菜单。到达累计滚动上限需人工检查，不能无界重试。
 
 ## 迁移旧 X 库

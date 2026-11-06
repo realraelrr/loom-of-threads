@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 from urllib.parse import urlsplit
 import re
-from .content import from_capture, iso
+from .content import from_capture, iso, referenced_ids, reference_scope
 from .threads import ThreadGraph
 from ...core.model import validate, timestamp
 from ...core.store import unique_object
@@ -30,6 +30,9 @@ def _capture(capture_dir):
             "Only observed/partial successful capture reports may be ingested"
         )
     selected = report["selected_id"]
+    depth = report.get("reference_depth", 1)
+    if type(depth) is not int or depth != 1:
+        raise ValueError("Unsupported capture reference_depth")
     if (
         not isinstance(selected, str)
         or not selected.isascii()
@@ -154,13 +157,15 @@ def ingest(store, capture_dir, collection="likes"):
     selected = report["selected_id"]
     graph = ThreadGraph(chosen.values())
     thread = graph.resolve(selected)
-    needed = set(thread.node_ids) | set(thread.context_ids)
-    for tid in list(needed):
-        needed.update(
-            chosen[tid][key]
-            for key in ("quoted_id", "reposted_id")
-            if chosen[tid].get(key) in chosen
-        )
+    roots = set(thread.node_ids) | set(thread.context_ids)
+    included, scope = reference_scope(chosen, roots)
+    needed = included & chosen.keys()
+    missing_references = [
+        f"{tid}:missing_reference:{reference}"
+        for tid in sorted(roots)
+        for reference in referenced_ids(chosen[tid])
+        if reference not in chosen
+    ]
     selected_rid = "x:" + selected
     with store.writer():
         data, expected = store.snapshot()
@@ -198,7 +203,7 @@ def ingest(store, capture_dir, collection="likes"):
                 "ignored_stale": True,
                 "capture_state": entry["capture_state"],
             }
-        unresolved = list(global_issues)
+        unresolved = [*global_issues, *missing_references]
         if stale_selected:
             needed = {selected}
             unresolved.append("older_selection_observation")
@@ -261,6 +266,7 @@ def ingest(store, capture_dir, collection="likes"):
             "collections": collections,
             "label": entry.get("label") if entry else None,
             "capture_state": "partial" if partial else "observed",
+            "capture_scope": scope,
             "last_captured_at": selected_time.isoformat().replace("+00:00", "Z"),
             "capture_issues": {
                 "missing_parents": list(thread.missing_parent_ids),

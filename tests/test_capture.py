@@ -3,12 +3,18 @@ import fcntl
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from subprocess import CompletedProcess
 
 from knowledge_archive.adapters.x.capture import (
     CaptureError,
+    ChromeDevTools,
+    _progress,
     capture_thread,
     decode_evaluation,
 )
+
+from test_ingest import article_with_tweets
 
 
 def observation(ids=("100", "101"), target="101", state="content", issues=None):
@@ -60,12 +66,49 @@ class Browser:
     def evaluate(self, page_id, script):
         self.calls += 1
         value = next(self.observations)
-        if isinstance(value, Exception):
+        if isinstance(value, BaseException):
             raise value
         return value
 
 
 class CaptureTests(unittest.TestCase):
+    def test_cli_text_error_array_preserves_connection_diagnostic(self):
+        response = [
+            {"type": "text", "text": "Chrome is not running."},
+            {"type": "text", "text": "DevToolsActivePort could not be read."},
+        ]
+        result = CompletedProcess([], 0, json.dumps(response), "")
+        client = ChromeDevTools(["synthetic-cli"])
+        with patch("knowledge_archive.adapters.x.capture.subprocess.run", return_value=result):
+            with self.assertRaises(CaptureError) as raised:
+                client.call("list_pages")
+        self.assertIn("list_pages", str(raised.exception))
+        self.assertIn("Chrome is not running", str(raised.exception))
+        self.assertIn("DevToolsActivePort", str(raised.exception))
+        self.assertEqual(client.calls, 1)
+
+    def test_cli_unknown_response_shapes_fail_explicitly(self):
+        for response in (None, True, 12, "unexpected", [], [{"type": "text", "text": 12}]):
+            with self.subTest(response=response):
+                result = CompletedProcess([], 0, json.dumps(response), "")
+                with patch("knowledge_archive.adapters.x.capture.subprocess.run", return_value=result):
+                    with self.assertRaisesRegex(CaptureError, "unexpected CLI response type"):
+                        ChromeDevTools(["synthetic-cli"]).call("list_pages")
+
+    def test_cli_error_array_diagnostic_is_bounded(self):
+        response = [{"type": "text", "text": "x" * 5000}] * 10
+        result = CompletedProcess([], 0, json.dumps(response), "")
+        with patch("knowledge_archive.adapters.x.capture.subprocess.run", return_value=result):
+            with self.assertRaises(CaptureError) as raised:
+                ChromeDevTools(["synthetic-cli"]).call("list_pages")
+        self.assertLessEqual(len(str(raised.exception)), 1100)
+
+    def test_cli_object_response_is_preserved(self):
+        response = {"pages": [{"id": 1}]}
+        result = CompletedProcess([], 0, json.dumps(response), "")
+        with patch("knowledge_archive.adapters.x.capture.subprocess.run", return_value=result):
+            self.assertEqual(ChromeDevTools(["synthetic-cli"]).call("list_pages"), response)
+
     def run_capture(self, browser, **kwargs):
         with tempfile.TemporaryDirectory() as temp:
             destination = Path(temp) / "probe"
@@ -75,6 +118,170 @@ class CaptureTests(unittest.TestCase):
             for name in report["observation_files"]:
                 self.assertTrue((destination / name).exists())
             return report
+
+    def test_progress_follows_only_used_explicit_article_references(self):
+        obs = observation(ids=("100",), target="100")
+        record = obs["records"][0]
+        record["article"] = article_with_tweets("200", "200")
+        state = record["article"]["content_state"]
+        state["entityMap"].append(
+            {"key": "unused", "value": {"type": "TWEET", "data": {"tweetId": "999"}}}
+        )
+        state["blocks"].append({"type": "unstyled", "text": "https://x.com/i/status/888"})
+        record["quoted_id"] = "300"
+        _, queue, _, _, scope = _progress([obs], "100", {"100"})
+        self.assertEqual(queue, ["200", "300"])
+        reference = observation(ids=("200",), target="200")["records"][0]
+        reference["quoted_id"] = "100"
+        obs["records"].append(reference)
+        _, queue, _, _, scope = _progress([obs], "100", {"100", "200", "300"})
+        self.assertEqual(queue, [])
+
+    def test_confirmed_context_finishes_without_scrolling_comments(self):
+        root = observation(ids=("101",), target="101")
+        root["records"][0]["reply_to_author_id"] = "20"
+        context = observation(ids=("100",), target="100")
+        context["records"][0]["author"]["id"] = "20"
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "probe"
+            report = capture_thread(Browser([root, root, root, context]),
+                                    "101", destination, 2, 2)
+            self.assertEqual(report["status"], "observed")
+            self.assertEqual(report["visits"][-1]["stop_reason"], "context_observed")
+            state = json.loads((destination / "checkpoint.json").read_text())
+            self.assertEqual(state["reference_done"], ["100"])
+            self.assertEqual(state["scrolls"]["100"], 0)
+            browser = Browser([])
+            self.assertEqual(capture_thread(browser, "101", destination, 2, 2, resume=True)["status"], "observed")
+            self.assertEqual(browser.calls, 0)
+
+    def test_resume_infers_context_body_from_existing_accepted_evidence(self):
+        root = observation(ids=("101", "100"), target="101")
+        root["records"][0]["reply_to_author_id"] = "20"
+        root["records"][1]["author"]["id"] = "20"
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "probe"
+            capture_thread(Browser([root]), "101", destination, 1, 0)
+            checkpoint = destination / "checkpoint.json"
+            state = json.loads(checkpoint.read_text())
+            state["done"] = ["101"]
+            state["queue"] = ["100"]
+            state.pop("reference_done", None)
+            checkpoint.write_text(json.dumps(state))
+            browser = Browser([])
+            report = capture_thread(browser, "101", destination, 2, 2, resume=True)
+            self.assertEqual(report["status"], "observed")
+            self.assertEqual(browser.calls, 0)
+            self.assertEqual(report["pending_page_ids"], [])
+        root["issues"] = [{"record_id": "100", "code": "missing_body"}]
+        _, queue, _, _, _ = _progress([root], "101", {"101"})
+        self.assertIn("100", queue)
+        root["issues"] = [{"record_id": None, "code": "unreadable_page"}]
+        _, queue, _, _, _ = _progress([root], "101", {"101"})
+        self.assertIn("100", queue)
+
+    def test_unknown_parent_requires_thread_observation_if_same_author(self):
+        root = observation(ids=("101",), target="101")
+        parent = observation(ids=("100",), target="100")
+        with tempfile.TemporaryDirectory() as temp:
+            report = capture_thread(Browser([root, root, root, parent, parent, parent]),
+                                    "101", Path(temp) / "probe", 2, 2)
+            self.assertEqual(report["status"], "observed")
+            self.assertEqual(report["visits"][-1]["stop_reason"], "no_new_visible_nodes")
+        _, queue, _, _, _ = _progress([root], "101", {"101"}, ["100"])
+        self.assertIn("100", queue)
+
+    def test_context_body_done_cannot_suppress_new_thread_role(self):
+        obs = observation(ids=("101", "100"), target="101")
+        # Body-level completion from an earlier context role does not certify
+        # thread coverage when current evidence identifies an author ancestor.
+        _, queue, _, _, _ = _progress([obs], "101", {"101"}, ["100"])
+        self.assertIn("100", queue)
+        obs["records"][1]["author"]["id"] = None
+        obs["records"][0]["reply_to_author_id"] = None
+        _, queue, _, _, _ = _progress([obs], "101", {"101"}, ["100"])
+        self.assertIn("100", queue)  # Unresolved context is not confirmed context.
+
+    def test_direct_reference_finishes_without_scrolling_comments(self):
+        root = observation(ids=("100",), target="100")
+        root["records"][0]["quoted_id"] = "200"
+        direct = observation(ids=("200",), target="200")
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "probe"
+            browser = Browser([root, root, root, direct])
+            report = capture_thread(browser, "100", destination, 2, 2)
+            self.assertEqual(report["status"], "observed")
+            self.assertEqual([v["stop_reason"] for v in report["visits"]], [
+                "no_new_visible_nodes", "direct_reference_observed"
+            ])
+            state = json.loads((destination / "checkpoint.json").read_text())
+            self.assertEqual(state["done"], ["100"])
+            self.assertEqual(state["reference_done"], ["200"])
+            self.assertEqual(state["scrolls"]["200"], 0)
+            resumed = Browser([])
+            self.assertEqual(capture_thread(resumed, "100", destination, 2, 2, resume=True)["status"], "observed")
+            self.assertEqual(resumed.calls, 0)
+
+    def test_direct_reference_extraction_gaps_do_not_complete(self):
+        for issue_id in ("200", None):
+            with self.subTest(issue_id=issue_id), tempfile.TemporaryDirectory() as temp:
+                root = observation(ids=("100",), target="100")
+                root["records"][0]["quoted_id"] = "200"
+                direct = observation(ids=("200",), target="200", issues=[
+                    {"record_id": issue_id, "code": "missing_body", "detail": "incomplete"}
+                ])
+                destination = Path(temp) / "probe"
+                report = capture_thread(Browser([root, direct]), "100", destination, 2, 0)
+                self.assertEqual(report["status"], "partial")
+                self.assertNotEqual(report["visits"][-1]["stop_reason"], "direct_reference_observed")
+                state = json.loads((destination / "checkpoint.json").read_text())
+                self.assertNotIn("200", state.get("reference_done", []))
+
+    def test_reference_that_becomes_thread_node_requires_thread_completion(self):
+        root = observation(ids=("100",), target="100")
+        root["records"][0]["quoted_id"] = "101"
+        direct = observation(ids=("101",), target="101")  # Explicit self-reply to 100.
+        with tempfile.TemporaryDirectory() as temp:
+            report = capture_thread(Browser([root, root, root, direct, direct, direct]),
+                                    "100", Path(temp) / "probe", 2, 2)
+            self.assertEqual(report["status"], "observed")
+            self.assertEqual(report["visits"][-1]["stop_reason"], "no_new_visible_nodes")
+        _, queue, _, _, _ = _progress([root, direct], "100", {"100"}, ["101"])
+        self.assertIn("101", queue)  # Body-only done cannot certify thread coverage.
+
+    def test_resume_discards_deep_queue_but_preserves_evidence(self):
+        root = observation(ids=("100",), target="100")
+        root["records"][0]["quoted_id"] = "200"
+        direct = observation(ids=("200",), target="200")
+        direct["records"][0]["quoted_id"] = "300"
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "probe"
+            capture_thread(Browser([root, direct]), "100", destination, 2, 0)
+            checkpoint = destination / "checkpoint.json"
+            state = json.loads(checkpoint.read_text())
+            names = list(state["accepted"])
+            state["done"] = ["100", "200"]
+            state["queue"] = ["300"]  # Old recursive scope checkpoint.
+            checkpoint.write_text(json.dumps(state))
+            browser = Browser([])
+            report = capture_thread(browser, "100", destination, 2, 0, resume=True)
+            self.assertEqual(browser.calls, 0)
+            self.assertEqual(report["status"], "observed")
+            self.assertEqual(report["pending_page_ids"], [])
+            self.assertEqual(report["observation_files"], names)
+            self.assertEqual(report["reference_depth"], 1)
+            self.assertEqual(report["excluded_reference_edges"], [
+                {"source_id": "200", "target_id": "300"}
+            ])
+
+    def test_article_reference_is_pending_when_capture_budget_ends(self):
+        obs = observation(ids=("101",))
+        obs["records"][0]["reply_to_id"] = None
+        obs["records"][0]["reply_to_author_id"] = None
+        obs["records"][0]["article"] = article_with_tweets("200")
+        report = self.run_capture(Browser([obs]), max_pages=1, max_scrolls=0)
+        self.assertEqual(report["status"], "partial")
+        self.assertIn("200", report["pending_page_ids"])
 
     def test_page_and_scroll_limits_are_reported_as_partial(self):
         browser = Browser([observation()])
@@ -116,6 +323,32 @@ class CaptureTests(unittest.TestCase):
         )
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["failures"][0]["reason"], "target_not_observed")
+        self.assertEqual(report["pending_page_ids"], ["101"])
+
+    def test_failed_first_frame_preserves_checkpoint_pending_and_original_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "probe"
+            report = capture_thread(
+                Browser([CaptureError("DevToolsActivePort unavailable")]),
+                "101", destination, 1, 0,
+            )
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["error"], "DevToolsActivePort unavailable")
+            self.assertEqual(report["pending_page_ids"], ["101"])
+            state = json.loads((destination / "checkpoint.json").read_text())
+            self.assertEqual(state["queue"], ["101"])
+
+    def test_interrupted_capture_recomputes_pending_from_accepted_evidence(self):
+        root = observation(ids=("101",), target="101")
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "probe"
+            with self.assertRaises(KeyboardInterrupt):
+                capture_thread(Browser([root, KeyboardInterrupt()]), "101", destination, 1, 2)
+            report = json.loads((destination / "report.json").read_text())
+            state = json.loads((destination / "checkpoint.json").read_text())
+            self.assertEqual(report["status"], "interrupted")
+            self.assertEqual(set(report["pending_page_ids"]), {"100", "101"})
+            self.assertEqual(state["queue"], report["pending_page_ids"])
 
     def test_resume_preserves_prior_evidence_and_continues_pending_nodes(self):
         with tempfile.TemporaryDirectory() as temp:

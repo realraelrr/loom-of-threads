@@ -129,6 +129,7 @@ def _run(
     atomic_json(run_path, run)
     started = time.monotonic()
     attempts_this_run = 0
+    reconciled_requests = 0
     previous_failures = len(run["failures"])
     stopped = None
     try:
@@ -213,6 +214,28 @@ def _run(
                 break
         if stopped is None:
             data = store.load()
+            completed = {}
+            for entry in data["entries"].values():
+                record = data["records"][entry["record_id"]]
+                if record["source"] == "x" and entry["capture_state"] == "observed":
+                    completed.setdefault(record["source_id"], set()).update(
+                        entry["collections"]
+                    )
+            # Manual imports/backfill may finish a queued discovery after it was
+            # saved. Reconcile each collection against current source truth before
+            # spending capture budget; scan anchors and attempt history are separate.
+            for tid, requested in list(state["pending"].items()):
+                remaining = [c for c in requested if c not in completed.get(tid, set())]
+                reconciled_requests += len(requested) - len(remaining)
+                if remaining:
+                    state["pending"][tid] = remaining
+                else:
+                    del state["pending"][tid]
+            if reconciled_requests:
+                atomic_json(state_path, state)
+                run["reconciled_requests"] = (
+                    run.get("reconciled_requests", 0) + reconciled_requests
+                )
             candidates = {
                 tid: [c for c in cols if c in collections]
                 for tid, cols in state["pending"].items()
@@ -285,7 +308,15 @@ def _run(
                     if report["status"] in ("observed", "partial"):
                         for collection in candidates[tid]:
                             ingest(store, capture_dir, collection)
-                        state["pending"].pop(tid, None)
+                        unhandled = [
+                            c
+                            for c in state["pending"].get(tid, [])
+                            if c not in candidates[tid]
+                        ]
+                        if unhandled:
+                            state["pending"][tid] = unhandled
+                        else:
+                            state["pending"].pop(tid, None)
                         imported = True
                     else:
                         run["failures"].append(
@@ -363,6 +394,7 @@ def _run(
         "discoveries": run["discoveries"],
         "failures": active_failures,
         "pending_discovered": len(state["pending"]),
+        "reconciled_requests": reconciled_requests,
         "pending_counts": {k: len(v) for k, v in outstanding.items()},
         "needs_curation": outstanding["need_labels"],
         "report": str(run_path.relative_to(store.root)),

@@ -197,6 +197,118 @@ class SyncTests(unittest.TestCase):
                 self.assertEqual(report["stop_reason"], reason)
                 self.assertEqual(report["failures"][0]["error"], reason)
 
+    def test_observed_pending_is_reconciled_without_recapture_or_resetting_progress(
+        self,
+    ):
+        data = self.store.load()
+        for entry in data["entries"].values():
+            entry.update(capture_state="observed", collections=["likes", "reposts"])
+        self.store.save(data)
+        # A disabled collection's already satisfied request can also be removed.
+        (self.root / "archive.toml").write_text(
+            '[sources.x]\nprofile="example"\ncollections=["likes"]\n'
+        )
+        state = {
+            "schema_version": 1,
+            "profile": "example",
+            "pending": {tid: ["reposts"] for tid in data["entries"]},
+            "attempts": {"100": {"count": 4, "status": "observed", "at": "old"}},
+            "scans": {
+                "likes": {"known_ids": ["old"], "depth": 17},
+                "reposts": {"known_ids": ["older"], "depth": 19},
+            },
+        }
+        atomic_json(self.root / "raw/sync-state.json", state)
+        with (
+            patch(
+                "knowledge_archive.adapters.x.sync.discover",
+                return_value={
+                    "ids": [],
+                    "status": "partial",
+                    "stop_reason": "scroll_budget",
+                },
+            ),
+            patch("knowledge_archive.adapters.x.sync.capture_thread") as capture,
+        ):
+            report = sync(self.store, object())
+        capture.assert_not_called()
+        after = load_json(self.root / "raw/sync-state.json")
+        self.assertEqual(after["pending"], {})
+        self.assertEqual(after["attempts"], state["attempts"])
+        self.assertEqual(after["scans"], state["scans"])
+        self.assertEqual(self.store.load(), data)
+        self.assertEqual(report["reconciled_requests"], 3)
+        self.assertEqual(report["processed_this_invocation"], 0)
+        self.assertEqual(report["pending_discovered"], 0)
+
+    def test_reconciliation_keeps_missing_collection_partial_and_absent_sources(self):
+        data = self.store.load()
+        data["entries"]["100"]["capture_state"] = "observed"
+        data["entries"]["101"]["capture_state"] = "partial"
+        data["entries"]["102"]["capture_state"] = "observed"
+        # Same source_id on a non-X record must not satisfy an X request.
+        data["records"]["demo:102"] = data["records"].pop("x:102")
+        data["records"]["demo:102"]["source"] = "demo"
+        data["entries"]["102"].update(record_id="demo:102", members=["demo:102"])
+        self.store.save(data)
+        requested = {
+            "100": ["likes", "reposts"],
+            "101": ["likes", "reposts"],
+            "102": ["likes"],
+            "999": ["reposts"],
+        }
+        atomic_json(
+            self.root / "raw/sync-state.json",
+            {
+                "schema_version": 1,
+                "profile": "example",
+                "pending": requested,
+                "attempts": {},
+            },
+        )
+        with (
+            patch(
+                "knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery
+            ),
+            patch(
+                "knowledge_archive.adapters.x.sync.capture_thread",
+                side_effect=RuntimeError("offline"),
+            ),
+        ):
+            report = sync(self.store, object())
+        self.assertEqual(
+            load_json(self.root / "raw/sync-state.json")["pending"],
+            {
+                "100": ["reposts"],
+                "101": ["likes", "reposts"],
+                "102": ["likes"],
+                "999": ["reposts"],
+            },
+        )
+        self.assertEqual(report["reconciled_requests"], 1)
+        self.assertEqual(report["pending_discovered"], 4)
+        self.assertEqual(self.store.load(), data)
+
+    def test_processing_enabled_collection_retains_unfulfilled_disabled_request(self):
+        (self.root / "archive.toml").write_text(
+            '[sources.x]\nprofile="example"\ncollections=["likes"]\n'
+        )
+        atomic_json(
+            self.root / "raw/sync-state.json",
+            {
+                "schema_version": 1,
+                "profile": "example",
+                "pending": {"100": ["likes", "reposts"]},
+                "attempts": {},
+            },
+        )
+        self.run_sync(max_entries=1)
+        self.assertEqual(
+            load_json(self.root / "raw/sync-state.json")["pending"],
+            {"100": ["reposts"]},
+        )
+        self.assertNotIn("reposts", self.store.load()["entries"]["100"]["collections"])
+
     def test_pending_collection_membership_survives_budget_and_failure(self):
         def discovered(client, profile, collection, *args, **kwargs):
             return {

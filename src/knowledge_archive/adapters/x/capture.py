@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .threads import ThreadGraph
+from .content import reference_scope
 from ...core.store import atomic_json, load_json, digest
 
 
@@ -53,6 +54,22 @@ class ChromeDevTools:
                 f"{tool} failed: {(result.stderr or result.stdout)[-1000:]}"
             )
         response = json.loads(result.stdout)
+        if not isinstance(response, dict):
+            detail = ""
+            if isinstance(response, list):
+                for block in response:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and isinstance(block.get("text"), str)
+                    ):
+                        detail = (detail + "\n" + block["text"][:1000])[:1000]
+                        if len(detail) == 1000:
+                            break
+            raise CaptureError(
+                f"{tool}: unexpected CLI response type {type(response).__name__}"
+                + (f": {detail.strip()}" if detail else "")
+            )
         if response.get("error") or response.get("isError"):
             raise CaptureError(f"{tool}: {response}")
         return response
@@ -125,9 +142,10 @@ def reader_script(
     )
 
 
-def _progress(observations: list[dict], selected_id: str, done: set[str]):
+def _progress(observations: list[dict], selected_id: str, done: set[str], reference_done=()):
     """Derive current work from evidence; persisted queue is only a report."""
     best, ranks, issues_by_id, page_issues = {}, {}, {}, {}
+    observed_bodies = set()
     for obs in observations:
         grouped = {}
         for issue in obs["issues"]:
@@ -139,14 +157,25 @@ def _progress(observations: list[dict], selected_id: str, done: set[str]):
             rank = (not issues, rid in obs["visible_ids"], obs["observed_at"])
             if rid not in best or rank >= ranks[rid]:
                 best[rid], ranks[rid], issues_by_id[rid] = record, rank, issues
+                observed_bodies.discard(rid)
+                if rid in obs["visible_ids"] and not issues and not grouped.get(None):
+                    observed_bodies.add(rid)
     if selected_id not in best:
-        return None, [selected_id], [], len(best)
+        return None, [selected_id], [], len(best), {
+            "reference_depth": 1,
+            "excluded_reference_edges": [],
+        }
     thread = ThreadGraph(best.values()).resolve(selected_id)
     related = list(dict.fromkeys([*thread.node_ids, *thread.context_ids]))
-    quote_ids = [
-        best[rid]["quoted_id"] for rid in related if best[rid].get("quoted_id")
-    ]
-    candidates = list(dict.fromkeys([*thread.missing_parent_ids, *related, *quote_ids]))
+    # Reuse visible, issue-free accepted bodies even from old checkpoints.
+    # Only quiet-page done can certify a thread; body evidence cannot suppress
+    # a visit when context/reference roles become thread or unresolved parents.
+    done = done | ((set(reference_done) | observed_bodies) - set(thread.node_ids)
+                   - set(thread.missing_parent_ids) - set(thread.unresolved_author_ids))
+    included, scope = reference_scope(best, related)
+    candidates = list(dict.fromkeys([
+        *thread.missing_parent_ids, *related, *sorted(included - set(related))
+    ]))
     issues = [issue for rid in candidates for issue in issues_by_id.get(rid, [])]
     issues.extend(issue for rows in page_issues.values() for issue in rows)
     needs_details = {
@@ -161,7 +190,7 @@ def _progress(observations: list[dict], selected_id: str, done: set[str]):
     queue = [rid for rid in candidates if rid not in done or rid in needs_details]
     if any(issue["record_id"] is None for issue in issues) and selected_id not in queue:
         queue.insert(0, selected_id)
-    return thread, queue, issues, len(best)
+    return thread, queue, issues, len(best), scope
 
 
 def capture_thread(
@@ -237,10 +266,10 @@ def _capture_locked(
             raise ValueError("Checkpoint evidence path or hash mismatch")
         if name in state["accepted"]:
             observations.append(load_json(path))
-    thread, queue, issues, count = _progress(
-        observations, selected_id, set(state["done"])
+    thread, queue, issues, count, scope = _progress(
+        observations, selected_id, set(state["done"]), state.get("reference_done", [])
     )
-    state["queue"] = queue
+    state["queue"] = list(queue)
     visited, failures = set(), []
     page_id = None
     token = "__knowledge_archive_" + uuid.uuid4().hex
@@ -295,8 +324,11 @@ def _capture_locked(
                     "--initScript=" + init,
                 )
             visited.add(target)
+            body_only = thread is not None and target not in (
+                *thread.node_ids, *thread.missing_parent_ids, *thread.unresolved_author_ids
+            )
             prior_scrolls = state["scrolls"].get(target, 0)
-            if prior_scrolls >= max_total_scrolls:
+            if prior_scrolls >= max_total_scrolls and not body_only:
                 report["visits"].append(
                     {
                         "target_id": target,
@@ -363,6 +395,23 @@ def _capture_locked(
                 seen.update(ids)
                 state["scrolls"][target] = max(prior_scrolls, step)
                 atomic_json(output / "checkpoint.json", state)
+                if thread is not None and target not in thread.node_ids:
+                    current, _, _, _, _ = _progress(
+                        observations, selected_id, set(state["done"]),
+                        state.get("reference_done", []),
+                    )
+                    if (
+                        target in obs["visible_ids"]
+                        and any(record["id"] == target for record in obs["records"])
+                        and not any(issue["record_id"] in (None, target) for issue in obs["issues"])
+                        and target not in (*current.node_ids, *current.missing_parent_ids,
+                                           *current.unresolved_author_ids)
+                    ):
+                        stop_reason = (
+                            "context_observed" if target in current.context_ids
+                            else "direct_reference_observed"
+                        )
+                        break
                 if (
                     step >= prior_scrolls
                     and idle >= 2
@@ -377,8 +426,8 @@ def _capture_locked(
                     "visible_posts": len(seen),
                 }
             )
-            thread, _, issues, count = _progress(
-                observations, selected_id, set(state["done"])
+            thread, _, issues, count, scope = _progress(
+                observations, selected_id, set(state["done"]), state.get("reference_done", [])
             )
             if thread is None:
                 raise CaptureError(
@@ -386,8 +435,12 @@ def _capture_locked(
                 )
             if stop_reason == "no_new_visible_nodes":
                 state["done"] = list(dict.fromkeys([*state["done"], target]))
-            thread, pending, issues, count = _progress(
-                observations, selected_id, set(state["done"])
+            elif stop_reason in ("direct_reference_observed", "context_observed"):
+                state["reference_done"] = list(dict.fromkeys([
+                    *state.get("reference_done", []), target
+                ]))
+            thread, pending, issues, count, scope = _progress(
+                observations, selected_id, set(state["done"]), state.get("reference_done", [])
             )
             state["queue"] = pending
             queue = [rid for rid in pending if rid not in visited]
@@ -406,6 +459,17 @@ def _capture_locked(
         report["status"] = "failed"
         report["error"] = str(error)
     finally:
+        if report["status"] in ("failed", "interrupted"):
+            try:
+                thread, pending, issues, count, scope = _progress(
+                    observations, selected_id, set(state["done"]),
+                    state.get("reference_done", []),
+                )
+                state["queue"] = pending
+            except (ValueError, KeyError, TypeError) as error:
+                # Contradictory/malformed evidence may itself have caused the
+                # failure. Keep the last valid pending snapshot and original error.
+                failures.append({"reason": "progress_recompute_failed", "detail": str(error)})
         if page_id is not None:
             try:
                 # Browser/MCP reconnects may recycle numeric page IDs. Only
@@ -428,6 +492,7 @@ def _capture_locked(
             report["observed_unique_posts"] = count
         report.update(
             {
+                **scope,
                 "observation_files": list(state["accepted"]),
                 "pending_page_ids": state["queue"],
                 "failures": failures,

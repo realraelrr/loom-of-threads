@@ -24,7 +24,7 @@ description: 增加、更新和维护 Loom of Threads 本地知识库，采集�
    uv run python -m knowledge_archive.adapters.x.capture POST_ID --output .archive/captures/UNIQUE_RUN --max-pages 12 --max-scrolls 6
    ```
    对同一未完成目录使用 `--resume`。检查 report.json 的 status、pending_page_ids、extraction_issues 和 visits；返回码 0 不代表内容绝对完整。达到 total_scroll_budget 或页面结构不支持时报告缺口，不无限重试。
-4. `ingest-x CAPTURE_DIR` 导入；程序保留作者连续回复和必要上文，其他评论不自动成为收录入口。`partial` 可以保存已获取的证据，但不得改成完整。
+4. `ingest-x CAPTURE_DIR` 导入；程序保留作者连续回复、必要上文和直接引用正文；更深引用保留链接，并用 capture_scope 记录边界。其他评论不自动成为收录入口。`partial` 可以保存已获取的证据，但不得改成完整。
 5. `pending` 列出未分类入口。根据完整阅读单元与原文决定标签：
    ```sh
    knowledge-archive label ENTRY_ID --l2 CATEGORY_ID --ttl tactical --status active

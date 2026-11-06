@@ -43,6 +43,38 @@ def article(media, blocks, entities):
 
 
 class ArticleLayoutTests(unittest.TestCase):
+    def test_atomic_link_preserves_position_and_escapes_url(self):
+        url = 'https://example.org/resource?q="<tag>"&next=1'
+        a = article(
+            [],
+            [{"text": "before"}, atomic(0), {"text": "after"}],
+            [{"key": "0", "value": {"type": "LINK", "data": {"url": url}}}],
+        )
+        blocks, issues = article_blocks(a, {}, "100")
+        self.assertEqual(issues, [])
+        self.assertEqual(blocks[0]["text"], "before")
+        self.assertEqual(blocks[2]["text"], "after")
+        escaped = 'https://example.org/resource?q=&quot;&lt;tag&gt;&quot;&amp;next=1'
+        self.assertEqual(blocks[1], {"kind": "markdown", "text": f'<a href="{escaped}">{escaped}</a>'})
+        self.assertEqual(from_capture(source(article=a), {})["coverage"], "observed")
+
+    def test_atomic_link_unknown_schema_and_unsafe_urls_stay_partial(self):
+        for data in (
+            {}, {"href": "https://example.org/"}, {"url": None},
+            {"url": 123}, {"url": "javascript:alert(1)"},
+            {"url": "data:text/html,<script>alert(1)</script>"},
+            {"url": "/relative"}, {"url": "https://"},
+            {"url": "https://user:secret@example.org/"}, ["https://example.org/"],
+        ):
+            with self.subTest(data=data):
+                a = article([], [{"text": "kept"}, atomic(0)], [
+                    {"key": "0", "value": {"type": "LINK", "data": data}}
+                ])
+                result = from_capture(source(article=a), {})
+                self.assertEqual(result["coverage"], "partial")
+                self.assertIn("invalid_article_link:0", result["issues"])
+                self.assertEqual(result["blocks"][-1], {"kind": "markdown", "text": "kept"})
+
     def test_explicit_media_order_beats_asset_list_order(self):
         a = article(
             [image("20"), image("10")],

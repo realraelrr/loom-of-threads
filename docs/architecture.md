@@ -33,3 +33,7 @@ The synthetic demo exercises a non-X source without browser access. Source adapt
 ## Incremental collection discovery
 
 Discovery verifies the logged-in account, collection route, and explicit viewer action flags. Reposts use the dedicated `/profile/reposts` route; wrapper event IDs and actor identity remain in evidence while the original post ID identifies the captured content. A known-ID overlap is a bounded incremental boundary, not proof of full platform history. Partial scans retain their original baseline and advance replay depth across runs; newly ingested prefixes cannot prematurely become the stop boundary. Capture attempt counts rotate historical work so one unresolved item does not starve the rest. Runtime reports distinguish source gaps from pending semantic curation. Scheduling is a host concern, not an internal daemon.
+
+## Reference scope
+
+Capture and ingestion share one reference-scope calculation: author-thread and required parent-context nodes are roots; their explicit quotes, repost targets, and used article TWEET entities are direct references. References inside those referenced records remain links. Reports and entries preserve `reference_depth: 1` and `excluded_reference_edges`. This boundary avoids unbounded traversal into unrelated topics. Missing direct references remain explicit gaps; out-of-scope edges do not imply failed capture. Existing evidence and previously stored deeper records are retained.

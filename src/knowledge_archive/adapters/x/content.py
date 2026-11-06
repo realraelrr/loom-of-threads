@@ -9,6 +9,45 @@ from ...core.model import web_url
 from .threads import Node
 
 
+def referenced_ids(source):
+    """Explicit content references only; prose and unused entities are not edges."""
+    refs = []
+    for key in ("quoted_id", "reposted_id"):
+        value = source.get(key)
+        if value is not None:
+            if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+                raise ValueError(f"Invalid {key}")
+            refs.append(value)
+    state = (source.get("article") or {}).get("content_state") or {}
+    entities = {str(e["key"]): e["value"] for e in state.get("entityMap") or []}
+    for block in state.get("blocks") or []:
+        if block.get("type") != "atomic":
+            continue
+        for ref in block.get("entityRanges") or []:
+            entity = entities.get(str(ref["key"]))
+            if entity and entity.get("type") == "TWEET":
+                value = str((entity.get("data") or {}).get("tweetId", ""))
+                if not value.isascii() or not value.isdigit():
+                    raise ValueError("Invalid article tweetId")
+                refs.append(value)
+    return list(dict.fromkeys(refs))
+
+
+def reference_scope(records, roots):
+    """Thread/context roots plus one reference edge, never an unbounded X graph."""
+    roots = set(roots)
+    direct = {ref for rid in roots for ref in referenced_ids(records[rid])}
+    included = roots | direct
+    excluded = [
+        {"source_id": rid, "target_id": ref}
+        for rid in sorted(direct - roots)
+        if rid in records
+        for ref in referenced_ids(records[rid])
+        if ref not in included
+    ]
+    return included, {"reference_depth": 1, "excluded_reference_edges": excluded}
+
+
 def iso(value):
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -207,6 +246,16 @@ def article_blocks(article, assets, tid, legacy=False):
                     )
                 elif typ == "DIVIDER":
                     blocks.append({"kind": "divider"})
+                elif typ == "LINK":
+                    try:
+                        url = web_url(data.get("url") if isinstance(data, dict) else None)
+                    except ValueError:
+                        issues.append(f"invalid_article_link:{ref['key']}")
+                        continue
+                    escaped = html.escape(url, quote=True)
+                    blocks.append(
+                        {"kind": "markdown", "text": f'<a href="{escaped}">{escaped}</a>'}
+                    )
                 elif typ == "TWEET":
                     blocks.append(
                         {
