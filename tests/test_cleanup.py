@@ -43,7 +43,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(digest(self.store.path), before)
         self.assertFalse(self.store.runtime.exists())
         self.assertEqual(plan["remove_records"], ["demo:100"])
-        result = apply(self.store, plan, plan["approval_token"])
+        result = apply(self.store, self.request)
         current = self.store.load()
         self.assertEqual(current["entries"], {})
         self.assertEqual(current["records"], {})
@@ -52,7 +52,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(tombstone["reason"], "Reviewed duplicate")
         validate(current, self.store)
         self.assertEqual(load_json(Path(result["backup"]) / "archive.json"), self.data)
-        self.assertEqual(load_json(Path(result["backup"]) / "plan.json"), plan)
+        self.assertEqual(load_json(Path(result["backup"]) / "request.json"), self.request)
         self.assertIn("not disk erasure", result["retention"]["scope"])
 
     def test_missing_synthesis_and_note_repairs_fail_before_any_write(self):
@@ -61,15 +61,15 @@ class CleanupTests(unittest.TestCase):
         entry["label"]["note"] = "Retain the context of [#100]"
         self.store.save(self.data)
         before = digest(self.store.path)
-        with self.assertRaisesRegex(ValueError, "reference"):
-            preview(self.store, {"entries": self.request["entries"]})
+        impact = preview(self.store, {"entries": self.request["entries"]})
+        self.assertTrue(any("reference" in error for error in impact["blocking_errors"]))
         with self.assertRaisesRegex(ValueError, "note reference"):
-            preview(self.store, self.request)
+            apply(self.store, self.request)
         self.request["notes"] = {"200": "Context reviewed; entry retained."}
         plan = preview(self.store, self.request)
         self.assertEqual(plan["reference_replacements"]["notes"]["200"]["before"], entry["label"]["note"])
         self.assertEqual(digest(self.store.path), before)
-        apply(self.store, plan, plan["approval_token"])
+        apply(self.store, self.request)
         self.assertEqual(self.store.load()["entries"]["200"]["label"]["note"], self.request["notes"]["200"])
 
     def test_shared_members_context_quote_and_reply_dependencies_survive(self):
@@ -97,7 +97,7 @@ class CleanupTests(unittest.TestCase):
         self.store.save(self.data)
         plan = preview(self.store, self.request)
         self.assertEqual(plan["remove_records"], ["demo:100", "demo:200"])
-        apply(self.store, plan, plan["approval_token"])
+        apply(self.store, self.request)
         self.assertEqual(set(self.store.load()["records"]), {"demo:300"})
 
     def test_shared_assets_and_posters_retained_physical_files_never_removed(self):
@@ -122,43 +122,32 @@ class CleanupTests(unittest.TestCase):
         plan = preview(self.store, self.request)
         self.assertEqual(plan["remove_asset_metadata"], ["private"])
         self.assertEqual(plan["retain_media_files"], ["private.jpg"])
-        apply(self.store, plan, plan["approval_token"])
+        apply(self.store, self.request)
         self.assertEqual(set(self.store.load()["assets"]), {"video", "shared"})
         self.assertTrue((self.store.media / "private.jpg").is_file())
         self.assertEqual(evidence.read_text(), "immutable synthetic evidence")
 
-    def test_wrong_approval_edit_stale_plan_other_archive_and_replay_rejected(self):
-        plan = preview(self.store, self.request)
-        before = digest(self.store.path)
-        with self.assertRaisesRegex(ValueError, "Approval token"):
-            apply(self.store, plan, "wrong")
-        tampered = deepcopy(plan)
-        tampered["request"]["entries"][0]["reason"] = "changed"
-        with self.assertRaisesRegex(ValueError, "edited"):
-            apply(self.store, tampered, plan["approval_token"])
-        other = Store(Path(self.tmp.name) / "other")
-        other.save(self.data)
-        with self.assertRaisesRegex(ValueError, "another archive"):
-            apply(other, plan, plan["approval_token"])
-        self.assertEqual(digest(self.store.path), before)
-        self.data["records"]["demo:100"]["title"] = "Edited after preview"
+    def test_unrelated_edit_does_not_invalidate_request_and_current_dependencies_survive(self):
+        preview(self.store, self.request)
+        self.add_record("demo:200")["blocks"] = [{"kind": "quote", "record_id": "demo:100"}]
+        self.add_entry("200", "demo:200")
         self.store.save(self.data)
-        with self.assertRaisesRegex(ValueError, "stale"):
-            apply(self.store, plan, plan["approval_token"])
-        plan = preview(self.store, self.request)
-        apply(self.store, plan, plan["approval_token"])
-        with self.assertRaisesRegex(ValueError, "stale"):
-            apply(self.store, plan, plan["approval_token"])
+        result = apply(self.store, self.request)
+        self.assertEqual(result["removed_records"], [])
+        self.assertIn("demo:100", self.store.load()["records"])
+        self.assertIn("200", self.store.load()["entries"])
+        with self.assertRaisesRegex(ValueError, "Unknown cleanup entry"):
+            apply(self.store, self.request)
 
     def test_writer_lock_backup_failure_and_concurrent_change_prevent_commit(self):
-        plan = preview(self.store, self.request)
+        preview(self.store, self.request)
         before = digest(self.store.path)
         with self.store.writer():
             with self.assertRaisesRegex(RuntimeError, "Another process"):
-                apply(self.store, plan, plan["approval_token"])
+                apply(self.store, self.request)
         with patch("knowledge_archive.core.cleanup.atomic_json", side_effect=OSError("disk full")):
             with self.assertRaisesRegex(OSError, "disk full"):
-                apply(self.store, plan, plan["approval_token"])
+                apply(self.store, self.request)
         self.assertEqual(digest(self.store.path), before)
         real_save = self.store.save
 
@@ -170,7 +159,7 @@ class CleanupTests(unittest.TestCase):
 
         with patch.object(self.store, "save", side_effect=edit_before_save):
             with self.assertRaisesRegex(RuntimeError, "changed"):
-                apply(self.store, plan, plan["approval_token"])
+                apply(self.store, self.request)
         self.assertEqual(self.store.load()["records"]["demo:100"]["title"], "Concurrent edit")
         self.assertIn("100", self.store.load()["entries"])
 
@@ -178,8 +167,8 @@ class CleanupTests(unittest.TestCase):
         self.add_entry("alias", "demo:100")
         self.store.save(self.data)
         self.request["entries"].append({"entry_id": "alias", "reason": "Same source alias"})
-        plan = preview(self.store, self.request)
-        apply(self.store, plan, plan["approval_token"])
+        preview(self.store, self.request)
+        apply(self.store, self.request)
         current = self.store.load()
         self.assertEqual(current["entries"], {})
         self.assertEqual(set(current["deleted_entries"]), {"100", "alias"})
@@ -203,8 +192,8 @@ class CleanupTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(main(prefix + ["cleanup-preview", str(request_path), "--output", str(self.store.path)]), 1)
             self.assertEqual(main(prefix + ["cleanup-preview", str(request_path), "--output", str(plan_path)]), 0)
-            plan = load_json(plan_path)
-            self.assertEqual(main(prefix + ["cleanup-apply", str(plan_path), "--approve", plan["approval_token"]]), 0)
+            self.assertEqual(load_json(plan_path)["blocking_errors"], [])
+            self.assertEqual(main(prefix + ["cleanup-apply", str(request_path)]), 0)
         self.assertEqual(self.store.load()["entries"], {})
 
 

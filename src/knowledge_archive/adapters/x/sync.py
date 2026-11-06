@@ -9,9 +9,30 @@ import uuid
 from .capture import CaptureError, capture_thread
 from .discover import discover
 from .ingest import ingest
-from .retry import extractor_revision, is_deferred, retry_schedule
 from ...core.model import pending, validate
 from ...core.store import atomic_json, load_json, utcnow
+
+
+def _failure_state(report, previous):
+    if report.get("status") == "observed":
+        return {}
+    reasons = [v.get("stop_reason", "") for v in report.get("visits", [])]
+    reasons += [f.get("reason", "") for f in report.get("failures", [])]
+    error = report.get("error", "")
+    issues = report.get("extraction_issues", [])
+    login = "login" in error.lower() or "login_required" in reasons
+    reason = ("login_required" if login else "extraction_issues" if issues
+              else error or next((r for r in reasons if r), "incomplete_capture"))
+    consecutive = previous.get("consecutive_failures", 0) + 1
+    return {
+        "failure_reason": reason,
+        "failure_details": issues or report.get("failures", []) or report.get("visits", []),
+        "consecutive_failures": consecutive,
+        "paused": bool(
+            login or issues or report.get("parse_error")
+            or "progress_recompute_failed" in reasons or consecutive >= 3
+        ),
+    }
 
 
 def sync(
@@ -133,7 +154,11 @@ def _run(
     reconciled_requests = 0
     previous_failures = len(run["failures"])
     candidates = {}
-    revision = extractor_revision()
+    resumed_ids = (
+        set(run["processed"]) | {f.get("id") for f in run["failures"]}
+        | {run.get("active")}
+        if resume is not None else set()
+    )
     stopped = None
     try:
         for collection in collections:
@@ -266,36 +291,25 @@ def _run(
                                 [*candidates.get(record["source_id"], []), *cols]
                             )
                         )
-            # New discoveries precede historical retries. Explicit resume can
-            # retry early after a repair; ordinary scheduled runs honor cooldowns.
+            # Fresh discoveries always precede interrupted work and retries.
             queue = sorted(
                 candidates,
                 key=lambda tid: (
+                    not (tid in state["pending"] and tid not in state["attempts"]),
                     tid != run.get("active"),
                     not (resume is not None and tid in {
                         f.get("id") for f in run["failures"]
                     }),
-                    not (tid in state["pending"] and tid not in state["attempts"]),
                     state["attempts"].get(tid, {}).get("count", 0),
                     state["attempts"].get(tid, {}).get("at", ""),
                 ),
             )
             for tid in queue:
                 previous = state["attempts"].get(tid, {})
-                # Existing v1 attempts have no scheduling fields. Derive them
-                # from retained reports when possible, without changing evidence.
-                if (previous and not previous.get("next_retry_at")
-                        and previous.get("status") not in ("observed", "interrupted")
-                        and previous.get("capture")):
-                    old_report = store.root / previous["capture"] / "report.json"
-                    if not old_report.resolve().is_relative_to(runtime.resolve()):
-                        raise ValueError("Capture path escapes sync runtime")
-                    if old_report.is_file():
-                        previous.update(retry_schedule(
-                            load_json(old_report), previous, previous["at"], revision
-                        ))
-                if resume is None and is_deferred(previous, utcnow(), revision):
-                    continue
+                if previous.get("paused"):
+                    if tid not in resumed_ids:
+                        continue
+                    previous = {**previous, "consecutive_failures": 0}
                 remaining = int(max_seconds - (time.monotonic() - started))
                 if attempts_this_run >= max_entries or remaining < 1:
                     stopped = (
@@ -337,8 +351,8 @@ def _run(
                         max_seconds=remaining,
                     )
                     state["attempts"][tid]["status"] = report["status"]
-                    state["attempts"][tid].update(retry_schedule(
-                        report, previous, utcnow(), revision
+                    state["attempts"][tid].update(_failure_state(
+                        report, previous
                     ))
                     if report["status"] in ("observed", "partial"):
                         for collection in candidates[tid]:
@@ -372,8 +386,11 @@ def _run(
                     subprocess.TimeoutExpired,
                 ) as error:
                     state["attempts"][tid]["status"] = "failed"
-                    state["attempts"][tid].update(retry_schedule(
-                        {"status": "failed", "error": str(error)}, previous, utcnow(), revision
+                    state["attempts"][tid].update(_failure_state(
+                        {
+                            "status": "failed", "error": str(error),
+                            "parse_error": isinstance(error, (ValueError, KeyError, TypeError)),
+                        }, previous
                     ))
                     run["failures"].append({"id": tid, "error": str(error)})
                     if "login" in str(error).lower():
@@ -403,13 +420,12 @@ def _run(
         run["updated_at"] = utcnow()
         atomic_json(run_path, run)
     outstanding = pending(store.load())
-    deferred = [
+    paused = [
         {"id": tid, **{key: attempt[key] for key in (
-            "failure_reason", "failure_details", "deferred_reason", "next_retry_at"
+            "failure_reason", "failure_details", "consecutive_failures"
         )}}
         for tid in candidates
-        if (attempt := state["attempts"].get(tid, {}))
-        and is_deferred(attempt, utcnow(), revision)
+        if (attempt := state["attempts"].get(tid, {})).get("paused")
     ]
     active_failures = [
         f
@@ -439,7 +455,7 @@ def _run(
         "processed_total": len(run["processed"]),
         "discoveries": run["discoveries"],
         "failures": active_failures,
-        "deferred": deferred,
+        "paused": paused,
         "pending_discovered": len(state["pending"]),
         "reconciled_requests": reconciled_requests,
         "pending_counts": {k: len(v) for k, v in outstanding.items()},

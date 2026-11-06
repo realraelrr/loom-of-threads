@@ -71,20 +71,46 @@ class EngineTests(unittest.TestCase):
             )
         self.assertTrue((self.root / "view/README.md").is_file())
 
+    def test_fixed_view_reuses_unchanged_files_and_removes_obsolete_outputs(self):
+        build(self.store)
+        view = self.root / "view"
+        self.assertFalse(view.is_symlink())
+        doc = next((view / "records").glob("*.md"))
+        before = doc.stat().st_mtime_ns
+        obsolete = view / "records/obsolete.md"
+        obsolete.write_text("old output")
+        build(self.store)
+        self.assertEqual(doc.stat().st_mtime_ns, before)
+        self.assertFalse(obsolete.exists())
+        self.assertFalse((self.store.runtime / "builds").exists())
+        self.assertFalse(any(p.is_symlink() for p in view.rglob("*")))
+
+    def test_publish_failure_can_be_repaired_by_next_build(self):
+        build(self.store)
+        self.data["records"]["demo:100"]["title"] = "Updated"
+        self.store.save(self.data)
+        with patch("knowledge_archive.core.build.shutil.copyfile", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                build(self.store)
+        build(self.store)
+        doc = next((self.root / "view/records").glob("*.md")).read_text()
+        self.assertIn("Updated", doc)
+        self.assertFalse(list((self.root / "view").rglob("*.tmp")))
+
     def test_failed_build_keeps_previous_generation(self):
         build(self.store)
-        old = (self.root / "view").readlink()
+        old = (self.root / "view/archive.db").read_bytes()
         with patch(
             "knowledge_archive.core.build.make_db", side_effect=OSError("disk failure")
         ):
             with self.assertRaises(OSError):
                 build(self.store)
-        self.assertEqual((self.root / "view").readlink(), old)
+        self.assertEqual((self.root / "view/archive.db").read_bytes(), old)
         self.assertTrue((self.root / "view/archive.db").is_file())
 
     def test_changed_source_during_build_is_not_published(self):
         build(self.store)
-        old = (self.root / "view").readlink()
+        old = (self.root / "view/archive.db").read_bytes()
         from knowledge_archive.core.build import make_db
 
         def change(*args):
@@ -95,7 +121,7 @@ class EngineTests(unittest.TestCase):
         with patch("knowledge_archive.core.build.make_db", side_effect=change):
             with self.assertRaisesRegex(RuntimeError, "changed"):
                 build(self.store)
-        self.assertEqual((self.root / "view").readlink(), old)
+        self.assertEqual((self.root / "view/archive.db").read_bytes(), old)
 
     def test_compare_and_swap_preserves_concurrent_edit(self):
         original = digest(self.store.path)

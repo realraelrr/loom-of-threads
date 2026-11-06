@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loom-of-threads"
-version = "0.3.0"
+version = "0.4.0"
 description = "Loom of Threads: weave fragmented threads into auditable knowledge"
 requires-python = ">=3.11"
 dependencies = []

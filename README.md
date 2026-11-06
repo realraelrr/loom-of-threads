@@ -11,7 +11,7 @@ Loom of Threads 是可审计的本地 AI 知识库引擎。Agent 负责知识判
 - 按稳定作者 ID 和回复边恢复连续推文，不把其他读者评论混入作者线程。
 - 官方 Chrome DevTools CLI 后端，有界滚动和特定“更多回复”按钮展开；逐观察保存证据，可校验后恢复。
 - 旧六文件 X 归档一次性迁移，原始文件不删除；显式保留历史采集缺口。
-- 媒体哈希验证、下载主机白名单、不可变构建版本和原子发布指针。
+- 媒体哈希验证、下载主机白名单、固定阅读目录与校验后增量更新。
 - SQLite `entries`、`records`、`members` 三张表，以及 Markdown 阅读视图。
 
 支持已登录账号点赞、转发列表的有界增量扫描和历史补全；需要 Agent 完成分类与综述后再发布。调度由 Codex 等宿主承担。不能恢复 X 已删除、隐藏或无权查看的内容。`observed` 仅描述本次可见范围；`partial` 和预算耗尽必须作为缺口保留。
@@ -44,7 +44,7 @@ loom --root /path/to/archive fetch
 loom --root /path/to/archive build
 ```
 
-所有正式变更写进 `raw/archive.json`；证据位于 `raw/evidence/`，媒体位于 `media/`。构建先在 `.archive/builds/` 完整生成，再切换 `view`。失败保留上一版本。`media/` 需要独立备份，远程 URL 不是永久备份。
+所有正式变更写进 `raw/archive.json`；证据位于 `raw/evidence/`，媒体位于 `media/`。构建先在临时目录完整生成并校验，再增量更新普通目录 `view/`，最后清理失效产物。生成/校验失败不影响旧视图；发布阶段失败可能留下混合版本，报错后重新 build 修复。不保留多代构建。`media/` 需要独立备份，远程 URL 不是永久备份。
 
 当前使用单机写锁，并检查源文件变化以避免覆盖人工编辑；不要让多台机器同时修改同一云盘目录。
 
@@ -70,7 +70,7 @@ loom --root /path/to/archive sync-x --resume RUN_ID
 
 `sync-x` 报告新内容和 `needs_curation`，不替 Agent 编造标签或综述。接着按维护 Skill 整理，运行 `fetch` 和 `build`。预算到期退出码 2 表示仍有待办；登录失效、账号不符、页面变化应检查报告，不能宣称同步完整。列表静止不能证明账户历史完整。定期运行应保留 `raw/sync-state.json` 和 `.archive/sync/`；前者随真源备份，后者用于精确断点恢复，不要每次删进度重来。
 
-未完成采集按原因冷却，报告的 `deferred` 保留失败原因、细节及 `next_retry_at`。临时错误按 1/3/7/14 天退避，预算缺口按 7/14/30 天，来源暂不可见按 14/30 天，提取问题和进度诊断按 30 天复核；这些是调度策略，不代表来源永久失效或到期必能恢复。新发现优先于历史重试。提取问题先检查保留的观察 JSON：修复解析后可重新 `ingest-x`，缺少源字段则需要新观察；相关提取规则变更会提前解除提取冷却。修复登录、解析或调整有依据的预算后，可用 `sync-x --resume RUN_ID` 提前恢复。累计 `max_total_scrolls` 已耗尽的 checkpoint 不会因时间过去自动获得新预算，应先检查缺口，再显式提高 `--max-total-scrolls`；不要删 checkpoint 或无限增加预算。
+临时失败下轮自然重试；连续三次未完成（包括预算 partial），或登录失效/提取报错，会标记 `paused` 并保留原因、上下文和断点。新发现始终优先。检查报告后修复问题，再用 `sync-x --resume RUN_ID` 恢复该运行关联的暂停项；其他运行的暂停项不自动解锁。累计滚动预算不会因恢复而重置，调整预算需有具体依据。旧版本的日历冷却字段不再影响调度。
 
 真实验收覆盖点赞列表与账户匹配、独立转帖列表和转发事件到原帖的解析。转发事件 ID 与原帖 ID 分开保存，同一内容因点赞和转发收录时共享一个入口。Note Tweet 的 `inline_media` 非空布局仍缺真实协议样本，保留明确缺口；X Articles 图文位置已支持。
 
@@ -124,12 +124,15 @@ node --test tests/*.cjs
 
 ```sh
 loom cleanup-preview /path/to/request.json --output /path/to/plan.json
-# 用户审核计划并确认后，使用预览返回的 token：
-loom cleanup-apply /path/to/plan.json --approve APPROVAL_TOKEN
+# 用户审核具体条目及关联修改并确认后，执行同一请求：
+loom cleanup-apply /path/to/request.json
 loom check
 loom build
 ```
 
-请求至少包含 `{"entries":[{"entry_id":"ENTRY_ID","reason":"理由"}]}`；如有综述或 note 引用，需显式提供替换文字，详见清理 Skill。计划绑定库路径、真源版本与完整影响，真源变化后必须重新预览；token 只能绑定计划，不能代替人的确认。
+请求至少包含 `{"entries":[{"entry_id":"ENTRY_ID","reason":"理由"}]}`；如有综述或 note 引用，需显式提供替换文字，详见清理 Skill。预览列出影响和未修复引用。执行不需要 Token，也不绑定全库哈希；由 Agent 确认目标与文字修订仍符合用户授权，引擎按当前依赖保护共享内容。
 
-此操作移除当前真源中的入口和不再被其他记录依赖的关联内容，保留共享来源。它保留不可变证据、媒体物理文件、历史发布版本与 `.archive/cleanup/` 操作前快照，不是磁盘彻底擦除，也不会操作 X 的点赞或转发。`deleted_entries` 保存来源身份与理由，阻止同步或手动导入自动重建已删入口；其他入口仍可引用该来源。该字段随 `raw/archive.json` 备份。尚无撤销删除命令，不要通过手改删除记录绕过决策；恢复需单独明确范围。
+此操作移除当前真源中的入口和不再被其他记录依赖的关联内容，保留共享来源。它保留不可变证据、媒体物理文件、`.archive/cleanup/` 操作前快照，不是磁盘彻底擦除，也不会操作 X 的点赞或转发。`deleted_entries` 保存来源身份与理由，阻止同步或手动导入自动重建已删入口；其他入口仍可引用该来源。该字段随 `raw/archive.json` 备份。尚无撤销删除命令，不要通过手改删除记录绕过决策；恢复需单独明确范围。
+
+
+升级旧布局时，先确认根目录 `view` 是指向 `.archive/builds/` 的旧生成链接，再移除该链接并运行 build，生成普通目录。验证新视图后可删除旧 `.archive/builds/` 和已确认的 `view N` 副本；不要删除 raw 或 media。旧根目录 topics/articles/archive.db 别名不再需要，读取固定 view 下的对应路径即可。本引擎不再创建任何阅读视图符号链接；这不构成对网盘同步无冲突的保证。

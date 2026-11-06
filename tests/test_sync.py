@@ -1,5 +1,7 @@
 from copy import deepcopy
 import fcntl
+import json
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +10,7 @@ from unittest.mock import patch
 from knowledge_archive.adapters.x.sync import sync
 from knowledge_archive.core.store import Store, atomic_json, load_json
 from test_engine import example
+from test_capture import Browser
 
 
 class SyncTests(unittest.TestCase):
@@ -393,93 +396,153 @@ class SyncTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Another account sync"):
                 self.run_sync()
 
-    def test_budget_cooldown_preserves_pending_and_checkpoint_until_due(self):
+    def test_temporary_failure_retries_next_run_and_pauses_after_three(self):
+        with (
+            patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery),
+            patch("knowledge_archive.adapters.x.sync.capture_thread", side_effect=RuntimeError("offline")),
+        ):
+            for count in range(1, 4):
+                report = sync(self.store, object(), max_entries=3)
+                self.assertEqual(report["processed_this_invocation"], 3)
+                attempt = load_json(self.root / "raw/sync-state.json")["attempts"]["100"]
+                self.assertEqual(attempt["consecutive_failures"], count)
+                self.assertEqual(attempt["paused"], count == 3)
+            skipped = sync(self.store, object())
+        self.assertEqual(skipped["processed_this_invocation"], 0)
+        self.assertEqual(len(skipped["paused"]), 3)
+        resumed = self.run_sync(resume=report["run_id"], max_entries=3)
+        self.assertEqual(resumed["processed_this_invocation"], 3)
+        self.assertEqual(resumed["paused"], [])
+
+    def test_budget_partial_remains_pending_and_pauses_after_three(self):
         def bounded(*args, **kwargs):
             report = self.capture(*args, **kwargs)
             report["visits"] = [{"stop_reason": "total_scroll_budget"}]
             return report
 
         with (
-            patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-01T00:00:00Z"),
             patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery),
             patch("knowledge_archive.adapters.x.sync.capture_thread", side_effect=bounded),
             patch("knowledge_archive.adapters.x.sync.ingest", side_effect=self.ingest),
         ):
-            first = sync(self.store, object(), max_entries=3)
+            for _ in range(3):
+                report = sync(self.store, object(), max_entries=3)
+            skipped = sync(self.store, object())
+        self.assertEqual(report["pending_counts"]["need_capture"], 3)
+        self.assertEqual(len(report["paused"]), 3)
+        self.assertEqual(report["paused"][0]["failure_reason"], "total_scroll_budget")
+        self.assertEqual(skipped["processed_this_invocation"], 0)
         state = load_json(self.root / "raw/sync-state.json")
-        self.assertEqual(first["deferred"][0]["next_retry_at"], "2026-01-08T00:00:00Z")
-        self.assertEqual(first["deferred"][0]["failure_reason"], "total_scroll_budget")
-        checkpoint = self.root / state["attempts"]["100"]["capture"] / "checkpoint.json"
-        before = checkpoint.read_bytes()
-        with patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-04T00:00:00Z"):
-            cooling = self.run_sync(max_entries=3)
-        self.assertEqual(cooling["processed_this_invocation"], 0)
-        self.assertEqual(cooling["pending_counts"]["need_capture"], 3)
-        self.assertEqual(checkpoint.read_bytes(), before)
-        with patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-08T00:00:00Z"):
-            due = self.run_sync(max_entries=1)
-        self.assertEqual(due["processed_this_invocation"], 1)
-        self.assertEqual(self.seen[-1], ("100", True))
+        self.assertTrue((self.root / state["attempts"]["100"]["capture"] / "checkpoint.json").is_file())
 
-    def test_extraction_deferred_with_recovery_date_and_parser_change_unlocks(self):
+    def test_real_capture_parse_failure_pauses_immediately(self):
+        error = json.JSONDecodeError("invalid browser payload", "{", 1)
+        with patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery):
+            report = sync(self.store, Browser([error]), max_entries=1)
+        self.assertEqual(report["paused"][0]["id"], "100")
+        self.assertEqual(report["paused"][0]["failure_reason"], str(error))
+        attempt = load_json(self.root / "raw/sync-state.json")["attempts"]["100"]
+        capture_report = load_json(self.root / attempt["capture"] / "report.json")
+        self.assertTrue(capture_report["parse_error"])
+        self.assertEqual(capture_report["status"], "failed")
+
+    def test_progress_recompute_failure_pauses_immediately(self):
+        from knowledge_archive.adapters.x.sync import _failure_state
+
+        details = [{"reason": "progress_recompute_failed", "detail": "invalid evidence"}]
+        attempt = _failure_state({"status": "failed", "failures": details}, {})
+        self.assertTrue(attempt["paused"])
+        self.assertEqual(attempt["failure_reason"], "progress_recompute_failed")
+        self.assertEqual(attempt["failure_details"], details)
+
+    def test_capture_parse_exceptions_pause_but_transport_errors_retry(self):
+        for error, paused in (
+            (json.JSONDecodeError("invalid capture", "{", 1), True),
+            (ValueError("invalid field"), True),
+            (KeyError("missing field"), True),
+            (TypeError("invalid payload"), True),
+            (OSError("offline"), False),
+            (subprocess.TimeoutExpired("capture", 1), False),
+        ):
+            with self.subTest(error=type(error).__name__):
+                atomic_json(self.root / "raw/sync-state.json", {
+                    "schema_version": 1, "profile": "example",
+                    "pending": {}, "attempts": {},
+                })
+                with (
+                    patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery),
+                    patch("knowledge_archive.adapters.x.sync.capture_thread", side_effect=error),
+                ):
+                    report = sync(self.store, object(), max_entries=3)
+                    attempt = load_json(self.root / "raw/sync-state.json")["attempts"]["100"]
+                    self.assertEqual(attempt["paused"], paused)
+                    self.assertEqual(attempt["failure_reason"], str(error))
+                    self.assertEqual(attempt["consecutive_failures"], 1)
+                    self.assertEqual(len(report["paused"]), 3 if paused else 0)
+                    next_report = sync(self.store, object(), max_entries=3)
+                self.assertEqual(next_report["processed_this_invocation"], 0 if paused else 3)
+
+    def test_extraction_pauses_immediately_and_resume_is_scoped(self):
         def broken(*args, **kwargs):
             report = self.capture(*args, **kwargs)
             report["extraction_issues"] = [{"record_id": "100", "reason": "missing_text"}]
             return report
 
         with (
-            patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-01T00:00:00Z"),
-            patch("knowledge_archive.adapters.x.sync.extractor_revision", return_value="old"),
             patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery),
             patch("knowledge_archive.adapters.x.sync.capture_thread", side_effect=broken),
             patch("knowledge_archive.adapters.x.sync.ingest", side_effect=self.ingest),
         ):
-            first = sync(self.store, object(), max_entries=3)
-        self.assertEqual(first["deferred"][0]["deferred_reason"], "existing_evidence_needs_review")
-        self.assertEqual(first["deferred"][0]["next_retry_at"], "2026-01-31T00:00:00Z")
-        with (
-            patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-02T00:00:00Z"),
-            patch("knowledge_archive.adapters.x.sync.extractor_revision", return_value="new"),
-        ):
-            second = self.run_sync(max_entries=1)
-        self.assertEqual(second["processed_this_invocation"], 1)
+            first = sync(self.store, object(), max_entries=1)
+            second = sync(self.store, object(), max_entries=1)
+            third = sync(self.store, object(), max_entries=1)
+        self.assertEqual(len(third["paused"]), 3)
+        self.assertEqual(first["paused"][0]["failure_reason"], "extraction_issues")
+        self.assertEqual(self.run_sync()["processed_this_invocation"], 0)
+        resumed = self.run_sync(resume=second["run_id"])
+        self.assertEqual(resumed["processed_this_invocation"], 1)
+        self.assertEqual(self.seen[-1], ("101", True))
+        self.assertEqual({p["id"] for p in resumed["paused"]}, {"100", "102"})
 
-    def test_transient_backoff_caps_and_legacy_attempt_report_is_used(self):
-        from knowledge_archive.adapters.x.retry import retry_schedule
+    def test_observed_resets_failures_and_changing_errors_still_count(self):
+        from knowledge_archive.adapters.x.sync import _failure_state
 
         previous = {}
-        for expected in ("02", "04", "08", "15", "15"):
-            previous = retry_schedule(
-                {"status": "failed", "error": "transport unavailable"},
-                previous, "2026-01-01T00:00:00Z", "revision",
-            )
-            self.assertEqual(previous["next_retry_at"], f"2026-01-{expected}T00:00:00Z")
-        with patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-01T00:00:00Z"):
-            self.run_sync(max_entries=3)
-        state = load_json(self.root / "raw/sync-state.json")
-        for tid, attempt in state["attempts"].items():
-            state["attempts"][tid] = {k: attempt[k] for k in ("count", "at", "capture", "status")}
-        atomic_json(self.root / "raw/sync-state.json", state)
-        with patch("knowledge_archive.adapters.x.sync.utcnow", return_value="2026-01-02T00:00:00Z"):
-            report = self.run_sync(max_entries=3)
-        self.assertEqual(report["processed_this_invocation"], 0)
-        self.assertEqual(len(report["deferred"]), 3)
+        for i in range(3):
+            previous = _failure_state({"status": "failed", "error": str(i)}, previous)
+        self.assertTrue(previous["paused"])
+        self.assertEqual(_failure_state({"status": "observed"}, previous), {})
+        self.assertEqual(_failure_state({"status": "failed", "error": "login_required"}, {})["paused"], True)
 
-    def test_new_discovery_precedes_unattempted_history_and_cooled_failures(self):
+    def test_old_calendar_fields_do_not_block_retry(self):
+        atomic_json(self.root / "raw/sync-state.json", {
+            "schema_version": 1, "profile": "example", "pending": {},
+            "attempts": {"100": {"count": 1, "status": "failed", "at": "old",
+                                  "next_retry_at": "2099-01-01T00:00:00Z",
+                                  "extractor_revision": "old"}},
+        })
+        self.run_sync(max_entries=3)
+        self.assertIn(("100", False), self.seen)
+        attempt = load_json(self.root / "raw/sync-state.json")["attempts"]["100"]
+        self.assertNotIn("next_retry_at", attempt)
+        self.assertNotIn("extractor_revision", attempt)
+
+    def test_new_discovery_precedes_active_and_resume_failures(self):
         with (
             patch("knowledge_archive.adapters.x.sync.discover", side_effect=self.discovery),
             patch("knowledge_archive.adapters.x.sync.capture_thread", side_effect=RuntimeError("offline")),
         ):
-            sync(self.store, object(), max_entries=1)
-
-        def discovery(client, profile, collection, *args, **kwargs):
-            return {"ids": ["102"], "status": "observed", "stop_reason": "known_overlap"}
-
-        self.discovery = discovery
-        report = self.run_sync(max_entries=1)
+            first = sync(self.store, object(), max_entries=1)
+        run_path = self.root / first["report"]
+        run = load_json(run_path)
+        run["active"] = "100"
+        atomic_json(run_path, run)
+        state_path = self.root / "raw/sync-state.json"
+        state = load_json(state_path)
+        state["pending"]["102"] = ["likes"]
+        atomic_json(state_path, state)
+        self.run_sync(max_entries=1, resume=first["run_id"])
         self.assertEqual(self.seen, [("102", False)])
-        self.assertEqual(report["pending_counts"]["need_capture"], 3)
-        self.assertIn("100", [item["id"] for item in report["deferred"]])
 
     def test_deleted_source_is_suppressed_without_replacing_scan_baseline(self):
         data = self.store.load()

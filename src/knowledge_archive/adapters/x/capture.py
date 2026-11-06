@@ -458,6 +458,7 @@ def _capture_locked(
     ) as error:
         report["status"] = "failed"
         report["error"] = str(error)
+        report["parse_error"] = isinstance(error, (ValueError, KeyError, TypeError))
     finally:
         if report["status"] in ("failed", "interrupted"):
             try:

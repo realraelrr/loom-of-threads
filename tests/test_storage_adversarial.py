@@ -48,7 +48,7 @@ class StorageAdversarialTests(unittest.TestCase):
 
     def test_edit_between_snapshot_read_and_caller_use_is_not_published(self):
         build(self.store)
-        original_view = (self.store.root / "view").readlink()
+        original_view = (self.store.root / "view/archive.db").read_bytes()
         snapshot = self.store.snapshot
 
         def edit_after_read():
@@ -61,7 +61,7 @@ class StorageAdversarialTests(unittest.TestCase):
         with patch.object(self.store, "snapshot", side_effect=edit_after_read):
             with self.assertRaisesRegex(RuntimeError, "changed"):
                 build(self.store)
-        self.assertEqual((self.store.root / "view").readlink(), original_view)
+        self.assertEqual((self.store.root / "view/archive.db").read_bytes(), original_view)
         self.assertEqual(
             self.store.load()["records"]["demo:100"]["blocks"][0]["text"], "USER EDIT"
         )
@@ -172,7 +172,7 @@ class StorageAdversarialTests(unittest.TestCase):
         unrelated = self.store.root / "other"
         unrelated.mkdir()
         (self.store.root / "view").symlink_to("other", target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, "unrelated"):
+        with self.assertRaisesRegex(ValueError, "symlink"):
             build(self.store)
         self.assertEqual((self.store.root / "view").readlink(), Path("other"))
 

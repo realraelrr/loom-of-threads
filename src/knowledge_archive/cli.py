@@ -35,7 +35,7 @@ def execute(args):
     if args.command == "cleanup-apply":
         from .core.cleanup import apply
 
-        return apply(store, load_json(args.plan), args.approve)
+        return apply(store, load_json(args.request))
     if args.command == "sync-x":
         from .adapters.x.capture import ChromeDevTools
         from .adapters.x.sync import sync
@@ -154,9 +154,8 @@ def main(argv=None):
     p = sub.add_parser("cleanup-preview", help="Preview exact entry removal; retains evidence and media")
     p.add_argument("request", type=Path)
     p.add_argument("--output", type=Path, required=True)
-    p = sub.add_parser("cleanup-apply", help="Apply a reviewed plan after human confirmation")
-    p.add_argument("plan", type=Path)
-    p.add_argument("--approve", required=True, help="Exact approval_token from the reviewed plan")
+    p = sub.add_parser("cleanup-apply", help="Apply a cleanup request after human confirmation")
+    p.add_argument("request", type=Path)
     p = sub.add_parser("sync-x")
     p.add_argument("--max-entries", type=int, default=20)
     p.add_argument("--max-seconds", type=int, default=900)

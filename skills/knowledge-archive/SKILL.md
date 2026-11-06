@@ -24,7 +24,7 @@ description: 增加、更新和维护 Loom of Threads 本地知识库，采集�
 
 1. `check`、`pending`、`watermark --collection likes`：从真实状态确定待办，不依赖上次聊天记忆。水位线是近期入口集合，不是“遇到一个 ID 就肯定采完”的证明。
 2. 采集 X 时使用官方 Chrome DevTools CLI/MCP 连接已登录浏览器。先确认连接；不导出 Cookie。页面编号仅会话内有效。页面异常可用 Computer Use 检查，但原文和媒体应由结构化采集器落盘。
-3. 账户更新先运行 `loom sync-x --max-entries 20 --max-seconds 900`，可用 `--devtools-command node /path/to/chrome-devtools.js` 指定官方 CLI。核对报告中的 discoveries、failures、needs_curation、pending_counts 和 deferred；后者说明延后原因及 next_retry_at，不是完成或放弃。先检查已有证据能否重新 ingest；仅在已修复登录/解析或有依据调整预算后用 resume 提前重试。累计滚动预算不会随冷却到期重置，不删除 checkpoint 或无限提高预算；退出码 2 表示 partial。中断使用 `--resume RUN_ID`；正常下一周期创建新 run，保留 `raw/sync-state.json` 的扫描基线与历史尝试次数，以及 `.archive/sync/` 的抓取断点。不删除待办规避错误。
+3. 账户更新先运行 `loom sync-x --max-entries 20 --max-seconds 900`，可用 `--devtools-command node /path/to/chrome-devtools.js` 指定官方 CLI。核对报告中的 discoveries、failures、needs_curation、pending_counts 和 paused；暂停项保留原因，不是完成或删除。临时失败下轮再试，连续三次未完成或登录/提取错误会暂停。检查已有证据能否重新 ingest，修复后用 resume 恢复该运行相关项。累计滚动预算不会重置，不删除 checkpoint 或无限提高预算；退出码 2 表示 partial。中断使用 `--resume RUN_ID`；正常下一周期创建新 run，保留 `raw/sync-state.json` 的扫描基线与历史尝试次数，以及 `.archive/sync/` 的抓取断点。不删除待办规避错误。
    对明确的 X 入口也可运行：
    ```sh
    uv run python -m knowledge_archive.adapters.x.capture POST_ID --output .archive/captures/UNIQUE_RUN --max-pages 12 --max-scrolls 6
@@ -37,7 +37,7 @@ description: 增加、更新和维护 Loom of Threads 本地知识库，采集�
    ```
    分类不匹配时保留待办并提出建议，不硬塞分类。非 active 必须用 `--note` 解释。复核仍有效时用 `--reviewed-at` 记录带时区时间，不为消除提示而改变 TTL。
 6. 新内容改变结论时，用 `synthesis L2 JSON_FILE` 更新该分类的字符串数组。`[#ENTRY_ID]` 引用同分类入口；区分作者意见、可核实事实、适用条件，不把同源重复帖子当独立证据。
-7. `fetch` 完成媒体校验，`build` 发布一致版本。失败保留旧阅读版本；已经抓到的原文无需重新采集。`audit` 输出到期复核项。
+7. `fetch` 完成媒体校验，`build` 发布一致版本。生成/校验失败保留旧视图；固定目录发布阶段失败可能留下混合结果，应重新 build 修复，不能宣称已完整发布。已经抓到的原文无需重新采集。`audit` 输出到期复核项。
 
 ## 修改与删除
 

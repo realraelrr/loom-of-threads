@@ -1,13 +1,14 @@
-"""Build an immutable generation, then publish with one symlink replacement."""
+"""Validate a staged build, then update a fixed reading directory."""
 
 from contextlib import closing
+from pathlib import Path
 import hashlib
 import html
 import os
 import re
 import shutil
 import sqlite3
-import uuid
+import tempfile
 from urllib.parse import quote
 from .assets import verify_asset
 from .model import CITATION, validate
@@ -39,14 +40,14 @@ def body(data, rid, depth=0):
             lines.append("---")
         elif kind == "image":
             filename = quote(data["assets"][b["asset"]]["file"])
-            lines.append(f"![{html.escape(b.get('alt', '图片'))}](../media/{filename})")
+            lines.append(f"![{html.escape(b.get('alt', '图片'))}](../../media/{filename})")
         elif kind == "video":
             filename = quote(data["assets"][b["asset"]]["file"])
             poster = (
                 quote(data["assets"][b["poster"]]["file"]) if b.get("poster") else ""
             )
             lines.append(
-                f'<video src="../media/{filename}" poster="../media/{poster}" controls></video>\n\n[播放本地视频](../media/{filename})'
+                f'<video src="../../media/{filename}" poster="../../media/{poster}" controls></video>\n\n[播放本地视频](../../media/{filename})'
             )
         elif kind == "quote":
             target = b["record_id"]
@@ -148,9 +149,8 @@ def build(store):
         bad = [aid for aid, a in data["assets"].items() if not verify_asset(store, a)]
         if bad:
             raise ValueError(f"Unverified media block publication: {bad}")
-        token = uuid.uuid4().hex
-        generation = store.runtime / "builds" / token
-        generation.mkdir(parents=True)
+        staging = tempfile.TemporaryDirectory(prefix="loom-build-")
+        generation = Path(staging.name)
         for name in ("topics", "records", "articles"):
             (generation / name).mkdir()
         l2_index = {s["id"]: (l, s) for l in data["taxonomy"] for s in l["subtopics"]}
@@ -230,7 +230,6 @@ def build(store):
                 encoding="utf-8",
             )
             make_db(generation / "archive.db", data, l2_index)
-            os.symlink(os.path.relpath(store.media, generation), generation / "media")
             atomic_json(
                 generation / "manifest.json",
                 {
@@ -252,22 +251,36 @@ def build(store):
                 raise RuntimeError(
                     "Source/config changed during build; previous publication retained"
                 )
-            pointer = store.root / "view"
-            if pointer.is_symlink():
-                if not pointer.resolve().is_relative_to(
-                    (store.runtime / "builds").resolve()
-                ):
-                    raise ValueError("Refusing to replace an unrelated view symlink")
-            elif pointer.exists():
-                raise ValueError("view must be absent or an engine-managed symlink")
-            temporary = store.root / (".view-" + token)
-            os.symlink(os.path.relpath(generation, store.root), temporary)
-            os.replace(temporary, pointer)
-        except BaseException:
-            shutil.rmtree(generation)
-            raise
+            destination = store.root / "view"
+            if destination.is_symlink():
+                raise ValueError("Replace the old view symlink with a directory before building")
+            destination.mkdir(exist_ok=True)
+            staged = {p.relative_to(generation) for p in generation.rglob("*") if p.is_file()}
+            # Markdown first, database next, manifest last. This is not an
+            # atomic multi-file publication; interrupted copies are repaired by build.
+            ordered = sorted(staged - {Path("archive.db"), Path("manifest.json")})
+            ordered += [Path("archive.db"), Path("manifest.json")]
+            for relative in ordered:
+                target = destination / relative
+                if target.is_symlink() or target.parent.is_symlink():
+                    raise ValueError(f"Generated output must not be a symlink: {relative}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = generation / relative
+                if target.exists() and target.read_bytes() == source.read_bytes():
+                    continue
+                temporary = target.with_name("." + target.name + ".tmp")
+                try:
+                    shutil.copyfile(source, temporary)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            for target in destination.rglob("*"):
+                if target.is_file() and target.relative_to(destination) not in staged:
+                    target.unlink()
+        finally:
+            staging.cleanup()
         return {
-            "generation": token,
+            "view": str(destination),
             "entries": len(data["entries"]),
             "records": len(data["records"]),
             "source_sha256": source_hash,

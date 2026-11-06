@@ -26,8 +26,8 @@ def main():
             else:
                 raise ValueError('No default archive configured; provide --root')
         root = root.expanduser().resolve()
-        generation = (root / 'view').resolve()
-        db = generation / 'archive.db'
+        view = root / 'view'
+        db = view / 'archive.db'
         if not db.is_file():
             raise ValueError('Published archive.db is missing; run archive maintenance first')
         where = ' OR '.join('(instr(lower(r.title),lower(?))>0 OR instr(lower(r.body),lower(?))>0)' for _ in args.keywords)
@@ -39,10 +39,10 @@ def main():
             results = []
             for row in rows:
                 result = dict(row)
-                result['local_file'] = str(generation / result.pop('file'))
+                result['local_file'] = str(view / result.pop('file'))
                 result['entries'] = [dict(e) for e in conn.execute('SELECT e.id,e.l2_topic,e.status,e.capture_state FROM members m JOIN entries e ON e.id=m.entry_id WHERE m.record_id=? ORDER BY e.id', (row['id'],))]
                 results.append(result)
-        print(json.dumps({'archive': str(root), 'generation': str(generation), 'results': results, 'limit': args.limit}, ensure_ascii=False, indent=2))
+        print(json.dumps({'archive': str(root), 'view': str(view), 'results': results, 'limit': args.limit}, ensure_ascii=False, indent=2))
         return 0
     except (OSError, ValueError, KeyError, sqlite3.Error) as error:
         parser.exit(1, f'Cannot search archive: {error}\n')

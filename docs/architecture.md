@@ -22,7 +22,7 @@ Capture observations are saved before later navigation. Checkpoints carry file h
 
 ## Publication
 
-Each build writes a fresh generation containing Markdown, SQLite, and a source fingerprint. It verifies assets and input references before switching the `view` symlink once. Earlier generations remain available. This isolates reading from failed builds; it is not a general multi-machine transaction or filesystem backup system.
+Each build stages Markdown, SQLite and a source manifest in a temporary directory and validates before updating the fixed `view/` directory. Unchanged files are retained; Markdown is updated before SQLite, then obsolete files are removed. There are no symlinks or retained generations. Publication is not atomic across files: an interrupted copy can leave mixed outputs and a subsequent build repairs them. Staging failures leave the previous view intact. Media links point directly to the archive media directory.
 
 ## Extension
 
@@ -43,12 +43,12 @@ Capture and ingestion share one reference-scope calculation: author-thread and r
 
 A stale selected observation cannot replace the entry's latest membership, context, coverage or scope. Associated records may still merge by their own observation timestamps and identity/relationship checks. `ignored_stale` refers to the selected entry decision; `merged_records` reports useful record updates. Imported evidence does not automatically clear an older entry's gaps.
 
-Sync records retry reasons and a bounded cooldown in existing attempt state. New discoveries precede historical retries. Deferred work stays pending with a next retry time; an explicit resume may bypass cooldown after inspection. Extraction issues can require reviewing stored observations before re-ingest; stored extracted JSON is not a replayable DOM. Expired cooldown is permission to attempt, not proof of recoverability or a reset of cumulative scroll budgets.
+Sync records consecutive incomplete attempts and pause reasons in existing attempt state. Temporary failures retry next run. Three consecutive incomplete attempts, authentication failure or extraction errors pause a source for explicit review. New discoveries have priority over active and retried work. Explicit resume only unlocks items associated with that run. There are no calendar delays or code-fingerprint unlocks. Cumulative scroll budgets remain intact.
 
 ## Reviewed removal
 
-Cleanup uses preview and apply over a snapshot-bound plan. The host obtains confirmation of the exact entries, reasons, resource impacts and explicit note/synthesis replacements. The approval token binds plan contents, not human identity. Apply re-derives impact under the archive writer lock and rejects changed source or plan contents before mutation.
+Cleanup preview shows entry identities, reasons, shared dependencies, explicit note/synthesis replacements and unresolved validation errors. After human confirmation the host applies the same request. There is no approval token, preview-time whole-archive hash or plan equality check. Apply calculates removal from current dependencies under the writer lock, validates references and saves an operation snapshot. The host rechecks the relevant content and text repairs before executing; unrelated archive edits do not invalidate the request.
 
-Removal is limited to selected entries and their dependency closure that no retained record or entry needs. Unrelated orphan records are not opportunistically collected. Shared quote/reply/member/context records and shared media metadata survive. Physical media, immutable evidence, old published generations and an operation snapshot remain; this is active-archive removal, not secure erasure. A subsequent build publishes the new view.
+Removal is limited to selected entries and their dependency closure that no retained record or entry needs. Unrelated orphan records are not opportunistically collected. Shared quote/reply/member/context records and shared media metadata survive. Physical media, immutable evidence and an operation snapshot remain; this is active-archive removal, not secure erasure. A subsequent build publishes the new view.
 
 Optional `deleted_entries` in the source snapshot records entry/source identities, reason and time. X discovery and ingest respect these decisions to avoid silently resurrecting deleted collection entries, while retained entries may still need the same source as context. Deletion decisions do not change the external account. Restoring an entry or purging all historical copies is a separate explicitly scoped operation.

@@ -1,17 +1,10 @@
-"""Reviewable, snapshot-bound removal of archive entries, never evidence erasure."""
+"""Preview and remove selected archive entries, never erase source evidence."""
 
 from copy import deepcopy
-import hashlib
-import json
+import uuid
 
 from .model import validate
-from .store import atomic_json, load_json, utcnow
-
-
-def _token(plan):
-    return hashlib.sha256(
-        json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+from .store import atomic_json, utcnow
 
 
 def _record_dependencies(record):
@@ -47,7 +40,7 @@ def _asset_ids(records):
     }
 
 
-def _prepare(store, data, expected, request):
+def _prepare(store, data, request):
     if not isinstance(request, dict) or set(request) - {"entries", "synthesis", "notes"}:
         raise ValueError("Cleanup request accepts only entries, synthesis, notes")
     choices = request.get("entries")
@@ -116,12 +109,8 @@ def _prepare(store, data, expected, request):
         del result["records"][rid]
     for aid in removed_assets:
         del result["assets"][aid]
-    # Broken citations require explicit replacements, never an inferred rewrite.
-    validate(result, store)
     plan = {
-        "plan_version": 1,
         "archive_root": str(store.root),
-        "archive_sha256": expected,
         "request": deepcopy(request),
         "entries": details,
         "remove_records": removed_records,
@@ -133,59 +122,51 @@ def _prepare(store, data, expected, request):
             "scope": "Remove selected entries and their unshared content from raw/archive.json; not disk erasure.",
             "evidence": "All immutable evidence is retained.",
             "media": "All physical media files are retained, including newly unreferenced files.",
-            "backup": "A complete pre-apply archive snapshot and this plan are retained in .archive/cleanup/<approval_token>/.",
-            "generated_views": "Existing generated views and old generations remain until build; build does not erase old generations.",
+            "backup": "A complete pre-apply archive snapshot and this request are retained in .archive/cleanup/<operation_id>/.",
+            "generated_views": "The fixed reading view is updated by build; immutable source evidence is retained.",
             "sync": "Source identities and reasons remain in deleted_entries to prevent entry reintroduction by sync/ingest. Shared content may still be captured as context.",
         },
         "next_steps": ["Run loom build to publish the changed active view; report any build failure."],
     }
-    plan["approval_token"] = _token(plan)
     return plan, result
 
 
 def preview(store, request):
-    data, expected = store.snapshot()
+    data = store.load()
     validate(data, store)
-    return _prepare(store, data, expected, request)[0]
+    impact, result = _prepare(store, data, request)
+    try:
+        validate(result, store)
+    except ValueError as error:
+        impact["blocking_errors"] = str(error).splitlines()
+    else:
+        impact["blocking_errors"] = []
+    return impact
 
 
-def apply(store, plan, approval):
-    """The token binds reviewed bytes; the calling Agent obtains human approval."""
-    if not isinstance(plan, dict) or approval != plan.get("approval_token"):
-        raise ValueError("Approval token must match the reviewed cleanup plan")
-    unsigned = {key: value for key, value in plan.items() if key != "approval_token"}
-    if _token(unsigned) != approval:
-        raise ValueError("Cleanup plan was edited; generate and review a new preview")
+def apply(store, request):
+    """The host confirms the requested entries and repairs before this command."""
     with store.writer():
         data, expected = store.snapshot()
         validate(data, store)
-        if plan.get("archive_root") != str(store.root) or plan.get("archive_sha256") != expected:
-            raise ValueError("Cleanup plan is stale or belongs to another archive; preview again")
-        fresh, result = _prepare(store, data, expected, plan["request"])
-        if fresh != plan:
-            raise ValueError("Cleanup impact changed; generate and review a new preview")
+        impact, result = _prepare(store, data, request)
         deleted = result.setdefault("deleted_entries", {})
         deleted_at = utcnow()
-        for item in plan["entries"]:
+        for item in impact["entries"]:
             deleted[item["entry_id"]] = {
                 key: item[key] for key in ("source", "source_id", "record_id", "reason")
             } | {"deleted_at": deleted_at}
         validate(result, store)
-        backup = store.runtime / "cleanup" / approval
+        backup = store.runtime / "cleanup" / uuid.uuid4().hex
         if not backup.resolve().is_relative_to(store.root):
             raise ValueError("Cleanup backup path escapes archive root")
-        for name, value in (("archive.json", data), ("plan.json", plan)):
-            path = backup / name
-            if path.exists() or path.is_symlink():
-                if path.is_symlink() or load_json(path) != value:
-                    raise ValueError(f"Existing cleanup backup differs: {name}")
-            else:
-                atomic_json(path, value)
+        atomic_json(backup / "archive.json", data)
+        atomic_json(backup / "request.json", request)
         store.save(result, expected)
     return {
-        "status": "ok", "removed_entries": [item["entry_id"] for item in plan["entries"]],
-        "removed_records": plan["remove_records"],
-        "removed_asset_metadata": plan["remove_asset_metadata"],
-        "backup": str(backup), "retention": plan["retention"],
-        "next_steps": plan["next_steps"],
+        "status": "ok", "removed_entries": [item["entry_id"] for item in impact["entries"]],
+        "removed_records": impact["remove_records"],
+        "removed_asset_metadata": impact["remove_asset_metadata"],
+        "backup": str(backup), "retention": impact["retention"],
+        "next_steps": impact["next_steps"],
     }
